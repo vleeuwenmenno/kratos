@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package profile_test
 
 import (
@@ -6,7 +9,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,7 +19,7 @@ import (
 
 	"github.com/ory/x/jsonx"
 
-	kratos "github.com/ory/kratos-client-go"
+	kratos "github.com/ory/kratos/internal/httpclient"
 
 	"github.com/ory/kratos/corpx"
 
@@ -29,6 +32,7 @@ import (
 	"github.com/ory/kratos/identity"
 	"github.com/ory/kratos/internal"
 	"github.com/ory/kratos/internal/testhelpers"
+	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/selfservice/flow/settings"
 	"github.com/ory/kratos/x"
 	"github.com/ory/x/assertx"
@@ -56,16 +60,17 @@ func newIdentityWithPassword(email string) *identity.Identity {
 }
 
 func TestStrategyTraits(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/identity.schema.json")
-	conf.MustSet(config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/")
+	conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/")
 	testhelpers.StrategyEnable(t, conf, identity.CredentialsTypePassword.String(), true)
 	testhelpers.StrategyEnable(t, conf, settings.StrategyProfile, true)
 
 	setPrivilegedTime := func(t *testing.T, duration time.Duration) {
-		conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, duration.String())
+		conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, duration.String())
 		t.Cleanup(func() {
-			conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
+			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
 		})
 	}
 
@@ -100,7 +105,7 @@ func TestStrategyTraits(t *testing.T) {
 			require.NoError(t, err)
 			defer res.Body.Close()
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode, "%+v", res.Request)
-			assert.Contains(t, res.Request.URL.String(), conf.Source().String(config.ViperKeySelfServiceLoginUI))
+			assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceLoginUI))
 		})
 
 		t.Run("type=api/spa", func(t *testing.T) {
@@ -185,7 +190,7 @@ func TestStrategyTraits(t *testing.T) {
 	t.Run("description=hydrate the proper fields", func(t *testing.T) {
 		setPrivileged(t)
 
-		var run = func(t *testing.T, id *identity.Identity, payload *kratos.SelfServiceSettingsFlow, route string) {
+		run := func(t *testing.T, id *identity.Identity, payload *kratos.SettingsFlow, route string) {
 			assert.NotEmpty(t, payload.Identity)
 			assert.Equal(t, id.ID.String(), string(payload.Identity.Id))
 			assert.JSONEq(t, string(id.Traits), x.MustEncodeJSON(t, payload.Identity.Traits))
@@ -200,13 +205,13 @@ func TestStrategyTraits(t *testing.T) {
 		}
 
 		t.Run("type=api", func(t *testing.T) {
-			pr, _, err := testhelpers.NewSDKCustomClient(publicTS, apiUser1).V0alpha2Api.InitializeSelfServiceSettingsFlowWithoutBrowser(context.Background()).Execute()
+			pr, _, err := testhelpers.NewSDKCustomClient(publicTS, apiUser1).FrontendApi.CreateNativeSettingsFlow(context.Background()).Execute()
 			require.NoError(t, err)
 			run(t, apiIdentity1, pr, settings.RouteInitAPIFlow)
 		})
 
 		t.Run("type=api", func(t *testing.T) {
-			pr, _, err := testhelpers.NewSDKCustomClient(publicTS, browserUser1).V0alpha2Api.InitializeSelfServiceSettingsFlowForBrowsers(context.Background()).Execute()
+			pr, _, err := testhelpers.NewSDKCustomClient(publicTS, browserUser1).FrontendApi.CreateBrowserSettingsFlow(context.Background()).Execute()
 			require.NoError(t, err)
 			run(t, browserIdentity1, pr, settings.RouteInitBrowserFlow)
 		})
@@ -219,23 +224,23 @@ func TestStrategyTraits(t *testing.T) {
 			rid := res.Request.URL.Query().Get("flow")
 			require.NotEmpty(t, rid)
 
-			pr, res, err := testhelpers.NewSDKCustomClient(publicTS, browserUser1).V0alpha2Api.GetSelfServiceSettingsFlow(context.Background()).Id(res.Request.URL.Query().Get("flow")).Execute()
+			pr, _, err := testhelpers.NewSDKCustomClient(publicTS, browserUser1).FrontendApi.GetSettingsFlow(context.Background()).Id(res.Request.URL.Query().Get("flow")).Execute()
 			require.NoError(t, err, "%s", rid)
 
 			run(t, browserIdentity1, pr, settings.RouteInitBrowserFlow)
 		})
 	})
 
-	var expectValidationError = func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
+	expectValidationError := func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
 		return testhelpers.SubmitSettingsForm(t, isAPI, isSPA, hc, publicTS, values,
 			testhelpers.ExpectStatusCode(isAPI || isSPA, http.StatusBadRequest, http.StatusOK),
-			testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+settings.RouteSubmitFlow, conf.SelfServiceFlowSettingsUI().String()))
+			testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+settings.RouteSubmitFlow, conf.SelfServiceFlowSettingsUI(ctx).String()))
 	}
 
 	t.Run("description=should come back with form errors if some profile data is invalid", func(t *testing.T) {
 		setPrivileged(t)
 
-		var check = func(t *testing.T, actual string) {
+		check := func(t *testing.T, actual string) {
 			assert.NotEmpty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==csrf_token).attributes.value").String(), "%s", actual)
 			assert.Equal(t, "too-short", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_long_string).attributes.value").String(), "%s", actual)
 			assert.Equal(t, "bazbar", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.stringy).attributes.value").String(), "%s", actual)
@@ -243,7 +248,7 @@ func TestStrategyTraits(t *testing.T) {
 			assert.Equal(t, "length must be >= 25, but got 9", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_long_string).messages.0.text").String(), "%s", actual)
 		}
 
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("method", "profile")
 			v.Set("traits.should_long_string", "too-short")
 			v.Set("traits.stringy", "bazbar")
@@ -294,7 +299,7 @@ func TestStrategyTraits(t *testing.T) {
 	})
 
 	t.Run("description=should end up at the login endpoint if trying to update protected field without sudo mode", func(t *testing.T) {
-		var run = func(t *testing.T, config *kratos.SelfServiceSettingsFlow, isAPI bool, c *http.Client) *http.Response {
+		run := func(t *testing.T, config *kratos.SettingsFlow, isAPI bool, c *http.Client) *http.Response {
 			time.Sleep(time.Millisecond)
 
 			values := testhelpers.SDKFormFieldsToURLValues(config.Ui.Nodes)
@@ -320,7 +325,7 @@ func TestStrategyTraits(t *testing.T) {
 			f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserUser1, true, publicTS)
 			res := run(t, f, true, browserUser1)
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode)
-			assert.Contains(t, res.Request.URL.String(), conf.Source().String(config.ViperKeySelfServiceLoginUI))
+			assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceLoginUI))
 		})
 
 		t.Run("type=browser", func(t *testing.T) {
@@ -328,7 +333,7 @@ func TestStrategyTraits(t *testing.T) {
 			f := testhelpers.InitializeSettingsFlowViaBrowser(t, browserUser1, false, publicTS)
 			res := run(t, f, false, browserUser1)
 			assert.EqualValues(t, http.StatusUnauthorized, res.StatusCode)
-			assert.Contains(t, res.Request.URL.String(), conf.Source().String(config.ViperKeySelfServiceLoginUI))
+			assert.Contains(t, res.Request.URL.String(), conf.GetProvider(ctx).String(config.ViperKeySelfServiceLoginUI))
 
 			t.Run("should update when signed back in", func(t *testing.T) {
 				setPrivileged(t)
@@ -339,7 +344,7 @@ func TestStrategyTraits(t *testing.T) {
 				defer res.Body.Close()
 
 				assert.EqualValues(t, http.StatusOK, res.StatusCode, "%s", body)
-				assert.EqualValues(t, settings.StateSuccess, gjson.GetBytes(body, "state").String(), "%s", body)
+				assert.EqualValues(t, flow.StateSuccess, gjson.GetBytes(body, "state").String(), "%s", body)
 			})
 		})
 	})
@@ -347,14 +352,14 @@ func TestStrategyTraits(t *testing.T) {
 	t.Run("flow=fail first update", func(t *testing.T) {
 		setPrivileged(t)
 
-		var check = func(t *testing.T, actual string) {
-			assert.EqualValues(t, settings.StateShowForm, gjson.Get(actual, "state").String(), "%s", actual)
+		check := func(t *testing.T, actual string) {
+			assert.EqualValues(t, flow.StateShowForm, gjson.Get(actual, "state").String(), "%s", actual)
 			assert.Equal(t, "1", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_big_number).attributes.value").String(), "%s", actual)
 			assert.Equal(t, "must be >= 1200 but found 1", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_big_number).messages.0.text").String(), "%s", actual)
 			assert.Equal(t, "foobar", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.stringy).attributes.value").String(), "%s", actual) // sanity check if original payload is still here
 		}
 
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("method", settings.StrategyProfile)
 			v.Set("traits.should_big_number", "1")
 		}
@@ -375,8 +380,8 @@ func TestStrategyTraits(t *testing.T) {
 	t.Run("flow=fail second update", func(t *testing.T) {
 		setPrivileged(t)
 
-		var check = func(t *testing.T, actual string) {
-			assert.EqualValues(t, settings.StateShowForm, gjson.Get(actual, "state").String(), "%s", actual)
+		check := func(t *testing.T, actual string) {
+			assert.EqualValues(t, flow.StateShowForm, gjson.Get(actual, "state").String(), "%s", actual)
 
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_big_number).messages.0.text").String(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_big_number).attributes.value").String(), "%s", actual)
@@ -390,7 +395,7 @@ func TestStrategyTraits(t *testing.T) {
 			assert.Equal(t, "foobar", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.stringy).attributes.value").String(), "%s", actual) // sanity check if original payload is still here
 		}
 
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("method", settings.StrategyProfile)
 			v.Del("traits.should_big_number")
 			v.Set("traits.should_long_string", "short")
@@ -410,17 +415,17 @@ func TestStrategyTraits(t *testing.T) {
 		})
 	})
 
-	var expectSuccess = func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
+	expectSuccess := func(t *testing.T, isAPI, isSPA bool, hc *http.Client, values func(url.Values)) string {
 		return testhelpers.SubmitSettingsForm(t, isAPI, isSPA, hc, publicTS, values,
 			http.StatusOK,
-			testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+settings.RouteSubmitFlow, conf.SelfServiceFlowSettingsUI().String()))
+			testhelpers.ExpectURL(isAPI || isSPA, publicTS.URL+settings.RouteSubmitFlow, conf.SelfServiceFlowSettingsUI(ctx).String()))
 	}
 
 	t.Run("flow=succeed with final request", func(t *testing.T) {
 		setPrivileged(t)
 
-		var check = func(t *testing.T, actual string) {
-			assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), "%s", actual)
+		check := func(t *testing.T, actual string) {
+			assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), "%s", actual)
 
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.numby).attributes.errors").Value(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_big_number).attributes.errors").Value(), "%s", actual)
@@ -431,7 +436,7 @@ func TestStrategyTraits(t *testing.T) {
 			assert.Equal(t, "this is such a long string, amazing stuff!", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_long_string).attributes.value").Value(), "%s", actual)
 		}
 
-		var payload = func(newEmail string) func(v url.Values) {
+		payload := func(newEmail string) func(v url.Values) {
 			return func(v url.Values) {
 				v.Set("method", settings.StrategyProfile)
 				v.Set("traits.email", newEmail)
@@ -459,11 +464,11 @@ func TestStrategyTraits(t *testing.T) {
 	t.Run("flow=try another update with invalid data", func(t *testing.T) {
 		setPrivileged(t)
 
-		var check = func(t *testing.T, actual string) {
-			assert.EqualValues(t, settings.StateShowForm, gjson.Get(actual, "state").String(), "%s", actual)
+		check := func(t *testing.T, actual string) {
+			assert.EqualValues(t, flow.StateShowForm, gjson.Get(actual, "state").String(), "%s", actual)
 		}
 
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("method", settings.StrategyProfile)
 			v.Set("traits.should_long_string", "short")
 		}
@@ -505,7 +510,7 @@ func TestStrategyTraits(t *testing.T) {
 		require.NoError(t, err)
 		defer res.Body.Close()
 
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		assert.True(t, returned, "%d - %s", res.StatusCode, body)
 	})
@@ -516,14 +521,14 @@ func TestStrategyTraits(t *testing.T) {
 	t.Run("description=should send email with verifiable address", func(t *testing.T) {
 		setPrivileged(t)
 
-		conf.MustSet(config.ViperKeySelfServiceVerificationEnabled, true)
-		conf.MustSet(config.ViperKeyCourierSMTPURL, "smtp://foo:bar@irrelevant.com/")
+		conf.MustSet(ctx, config.ViperKeySelfServiceVerificationEnabled, true)
+		conf.MustSet(ctx, config.ViperKeyCourierSMTPURL, "smtp://foo:bar@irrelevant.com/")
 		t.Cleanup(func() {
-			conf.MustSet(config.HookStrategyKey(config.ViperKeySelfServiceSettingsAfter, settings.StrategyProfile), nil)
+			conf.MustSet(ctx, config.HookStrategyKey(config.ViperKeySelfServiceSettingsAfter, settings.StrategyProfile), nil)
 		})
 
-		var check = func(t *testing.T, actual, newEmail string) {
-			assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), "%s", actual)
+		check := func(t *testing.T, actual, newEmail string) {
+			assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), "%s", actual)
 			assert.Equal(t, newEmail, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.email).attributes.value").Value(), "%s", actual)
 
 			m, err := reg.CourierPersister().LatestQueuedMessage(context.Background())
@@ -531,7 +536,7 @@ func TestStrategyTraits(t *testing.T) {
 			assert.Contains(t, m.Subject, "verify your email address")
 		}
 
-		var payload = func(newEmail string) func(v url.Values) {
+		payload := func(newEmail string) func(v url.Values) {
 			return func(v url.Values) {
 				v.Set("method", settings.StrategyProfile)
 				v.Set("traits.email", newEmail)
@@ -560,8 +565,8 @@ func TestStrategyTraits(t *testing.T) {
 	t.Run("description=should update protected field with sudo mode", func(t *testing.T) {
 		setPrivileged(t)
 
-		var check = func(t *testing.T, newEmail string, actual string) {
-			assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), "%s", actual)
+		check := func(t *testing.T, newEmail string, actual string) {
+			assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.numby).attributes.errors").Value(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_big_number).attributes.errors").Value(), "%s", actual)
 			assert.Empty(t, gjson.Get(actual, "ui.nodes.#(attributes.name==traits.should_long_string).attributes.errors").Value(), "%s", actual)
@@ -569,7 +574,7 @@ func TestStrategyTraits(t *testing.T) {
 			assert.Equal(t, "foobar", gjson.Get(actual, "ui.nodes.#(attributes.name==traits.stringy).attributes.value").String(), "%s", actual) // sanity check if original payload is still here
 		}
 
-		var payload = func(email string) func(v url.Values) {
+		payload := func(email string) func(v url.Values) {
 			return func(v url.Values) {
 				v.Set("method", settings.StrategyProfile)
 				v.Set("traits.email", email)

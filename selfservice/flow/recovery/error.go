@@ -1,8 +1,15 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package recovery
 
 import (
 	"net/http"
 	"net/url"
+
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/ory/kratos/x/events"
 
 	"github.com/ory/x/sqlxx"
 
@@ -55,48 +62,75 @@ func (s *ErrorHandler) WriteFlowError(
 	r *http.Request,
 	f *Flow,
 	group node.UiNodeGroup,
-	err error,
+	recoveryErr error,
 ) {
 	s.d.Audit().
-		WithError(err).
+		WithError(recoveryErr).
 		WithRequest(r).
 		WithField("recovery_flow", f).
 		Info("Encountered self-service recovery error.")
 
 	if f == nil {
-		s.forward(w, r, nil, err)
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), "", ""))
+		s.forward(w, r, nil, recoveryErr)
 		return
 	}
 
-	if e := new(flow.ExpiredError); errors.As(err, &e) {
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewRecoveryFailed(r.Context(), string(f.Type), f.Active.String()))
+
+	if expiredError := new(flow.ExpiredError); errors.As(recoveryErr, &expiredError) {
+		strategy, err := s.d.RecoveryStrategies(r.Context()).Strategy(f.Active.String())
+		if err != nil {
+			strategy, err = s.d.GetActiveRecoveryStrategy(r.Context())
+			// Can't retry the recovery if no strategy has been set
+			if err != nil {
+				s.d.SelfServiceErrorManager().Forward(r.Context(), w, r, err)
+				return
+			}
+		}
 		// create new flow because the old one is not valid
-		a, err := FromOldFlow(s.d.Config(r.Context()), s.d.Config(r.Context()).SelfServiceFlowRecoveryRequestLifespan(), s.d.GenerateCSRFToken(r), r, s.d.RecoveryStrategies(r.Context()), *f)
+		newFlow, err := FromOldFlow(s.d.Config(), s.d.Config().SelfServiceFlowRecoveryRequestLifespan(r.Context()), s.d.GenerateCSRFToken(r), r, strategy, *f)
 		if err != nil {
 			// failed to create a new session and redirect to it, handle that error as a new one
 			s.WriteFlowError(w, r, f, group, err)
 			return
 		}
 
-		a.UI.Messages.Add(text.NewErrorValidationRecoveryFlowExpired(e.Ago))
-		if err := s.d.RecoveryFlowPersister().CreateRecoveryFlow(r.Context(), a); err != nil {
-			s.forward(w, r, a, err)
+		newFlow.UI.Messages.Add(text.NewErrorValidationRecoveryFlowExpired(expiredError.ExpiredAt))
+		if err := s.d.RecoveryFlowPersister().CreateRecoveryFlow(r.Context(), newFlow); err != nil {
+			s.forward(w, r, newFlow, err)
 			return
 		}
 
-		// We need to use the new flow, as that flow will be a browser flow. Bug fix for:
-		//
-		// https://github.com/ory/kratos/issues/2049!!
-		if a.Type == flow.TypeAPI || x.IsJSONRequest(r) {
-			http.Redirect(w, r, urlx.CopyWithQuery(urlx.AppendPaths(s.d.Config(r.Context()).SelfPublicURL(),
-				RouteGetFlow), url.Values{"id": {a.ID.String()}}).String(), http.StatusSeeOther)
+		if s.d.Config().UseContinueWithTransitions(r.Context()) {
+			switch {
+			case newFlow.Type.IsAPI():
+				expiredError.FlowID = newFlow.ID
+				s.d.Writer().WriteError(w, r, expiredError.WithContinueWith(flow.NewContinueWithRecoveryUI(newFlow)))
+			case x.IsJSONRequest(r):
+				http.Redirect(w, r, urlx.CopyWithQuery(
+					urlx.AppendPaths(s.d.Config().SelfPublicURL(r.Context()), RouteGetFlow),
+					url.Values{"id": {newFlow.ID.String()}},
+				).String(), http.StatusSeeOther)
+			default:
+				http.Redirect(w, r, newFlow.AppendTo(s.d.Config().SelfServiceFlowRecoveryUI(r.Context())).String(), http.StatusSeeOther)
+			}
 		} else {
-			http.Redirect(w, r, a.AppendTo(s.d.Config(r.Context()).SelfServiceFlowRecoveryUI()).String(), http.StatusSeeOther)
+			// We need to use the new flow, as that flow will be a browser flow. Bug fix for:
+			//
+			// https://github.com/ory/kratos/issues/2049!!
+			if newFlow.Type == flow.TypeAPI || x.IsJSONRequest(r) {
+				http.Redirect(w, r, urlx.CopyWithQuery(urlx.AppendPaths(s.d.Config().SelfPublicURL(r.Context()),
+					RouteGetFlow), url.Values{"id": {newFlow.ID.String()}}).String(), http.StatusSeeOther)
+			} else {
+				http.Redirect(w, r, newFlow.AppendTo(s.d.Config().SelfServiceFlowRecoveryUI(r.Context())).String(), http.StatusSeeOther)
+			}
 		}
 		return
 	}
 
 	f.UI.ResetMessages()
-	if err := f.UI.ParseError(group, err); err != nil {
+	if err := f.UI.ParseError(group, recoveryErr); err != nil {
 		s.forward(w, r, f, err)
 		return
 	}
@@ -108,7 +142,7 @@ func (s *ErrorHandler) WriteFlowError(
 	}
 
 	if f.Type == flow.TypeBrowser && !x.IsJSONRequest(r) {
-		http.Redirect(w, r, f.AppendTo(s.d.Config(r.Context()).SelfServiceFlowRecoveryUI()).String(), http.StatusSeeOther)
+		http.Redirect(w, r, f.AppendTo(s.d.Config().SelfServiceFlowRecoveryUI(r.Context())).String(), http.StatusSeeOther)
 		return
 	}
 
@@ -117,7 +151,7 @@ func (s *ErrorHandler) WriteFlowError(
 		s.forward(w, r, updatedFlow, innerErr)
 	}
 
-	s.d.Writer().WriteCode(w, r, x.RecoverStatusCode(err, http.StatusBadRequest), updatedFlow)
+	s.d.Writer().WriteCode(w, r, x.RecoverStatusCode(recoveryErr, http.StatusBadRequest), updatedFlow)
 }
 
 func (s *ErrorHandler) forward(w http.ResponseWriter, r *http.Request, rr *Flow, err error) {

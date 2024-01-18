@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package identity_test
 
 import (
@@ -40,6 +43,12 @@ func TestSchemaExtensionCredentials(t *testing.T) {
 			ct:     identity.CredentialsTypePassword,
 		},
 		{
+			doc:    `{"emails":["foo@ory.sh","foo@ory.sh","bar@ory.sh"], "username": "foobar"}`,
+			schema: "file://./stub/extension/credentials/multi.schema.json",
+			expect: []string{"foo@ory.sh", "bar@ory.sh"},
+			ct:     identity.CredentialsTypeWebAuthn,
+		},
+		{
 			doc:    `{"emails":["FOO@ory.sh","bar@ory.sh"], "username": "foobar"}`,
 			schema: "file://./stub/extension/credentials/multi.schema.json",
 			expect: []string{"foo@ory.sh", "bar@ory.sh", "foobar"},
@@ -62,6 +71,21 @@ func TestSchemaExtensionCredentials(t *testing.T) {
 				Identifiers: []string{"not-foo@ory.sh"},
 			},
 			ct: identity.CredentialsTypeWebAuthn,
+		},
+		{
+			doc:    `{"email":"foo@ory.sh"}`,
+			schema: "file://./stub/extension/credentials/code.schema.json",
+			expect: []string{"foo@ory.sh"},
+			ct:     identity.CredentialsTypeCodeAuth,
+		},
+		{
+			doc:    `{"email":"FOO@ory.sh"}`,
+			schema: "file://./stub/extension/credentials/code.schema.json",
+			expect: []string{"foo@ory.sh"},
+			existing: &identity.Credentials{
+				Identifiers: []string{"not-foo@ory.sh"},
+			},
+			ct: identity.CredentialsTypeCodeAuth,
 		},
 	} {
 		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {

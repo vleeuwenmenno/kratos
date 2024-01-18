@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package node
 
 import "github.com/ory/kratos/text"
@@ -157,7 +160,6 @@ type AnchorAttributes struct {
 }
 
 // TextAttributes represents the attributes of a text node.
-//
 //
 // swagger:model uiNodeTextAttributes
 type TextAttributes struct {

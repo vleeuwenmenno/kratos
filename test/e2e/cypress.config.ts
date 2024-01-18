@@ -1,35 +1,45 @@
-import { defineConfig } from 'cypress'
-import got from 'got'
-const CRI = require('chrome-remote-interface')
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
+import { defineConfig } from "cypress"
+import got from "got"
+const CRI = require("chrome-remote-interface")
+
 let criPort = 0,
   criClient = null
 
 export default defineConfig({
   chromeWebSecurity: false,
-  retries: {
-    runMode: 6,
-    openMode: 1
-  },
   defaultCommandTimeout: 10000,
   requestTimeout: 10000,
-  projectId: 'bc48bg',
+  projectId: "bc48bg",
   video: true,
   videoCompression: false,
   screenshotOnRunFailure: true,
+
   e2e: {
-    videosFolder: 'cypress/videos',
-    screenshotsFolder: 'cypress/screenshots',
-    excludeSpecPattern: '**/*snapshots.js',
-    supportFile: 'cypress/support/index.js',
-    specPattern: '**/*.spec.{js,ts}',
-    baseUrl: 'http://localhost:4455/',
+    retries: {
+      runMode: 6,
+      openMode: 1,
+    },
+    videosFolder: "cypress/videos",
+    screenshotsFolder: "cypress/screenshots",
+    excludeSpecPattern: ["**/*snapshots.js", "playwright/**"],
+    supportFile: "cypress/support/index.js",
+    specPattern: "**/*.spec.{js,ts}",
+    baseUrl: "http://localhost:4455/",
     setupNodeEvents(on, config) {
-      on('before:browser:launch', (browser, args) => {
-        criPort = ensureRdpPort(args.args)
-        console.log('criPort is', criPort)
+      on("before:browser:launch", (browser, launchOptions) => {
+        criPort = ensureRdpPort(launchOptions.args)
+        console.log("criPort is", criPort)
+
+        if (browser.name.includes("chrom") && browser.isHeadless) {
+          launchOptions.args.push("--headless=new")
+        }
+        return launchOptions
       })
 
-      on('task', {
+      on("task", {
         httpRequest(params) {
           return got(params).then(({ body }) => body)
         },
@@ -50,19 +60,19 @@ export default defineConfig({
           }
 
           return criClient.send(args.query, args.opts)
-        }
+        },
       })
-    }
-  }
+    },
+  },
 })
 
 function ensureRdpPort(args) {
   const existing = args.find(
-    (arg) => arg.slice(0, 23) === '--remote-debugging-port'
+    (arg) => arg.slice(0, 23) === "--remote-debugging-port",
   )
 
   if (existing) {
-    return Number(existing.split('=')[1])
+    return Number(existing.split("=")[1])
   }
 
   const port = 40000 + Math.round(Math.random() * 25000)

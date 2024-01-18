@@ -1,7 +1,11 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package request
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,13 +13,17 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/ory/x/otelx"
 
 	"github.com/google/go-jsonnet"
 	"github.com/hashicorp/go-retryablehttp"
+	"github.com/pkg/errors"
 
+	"github.com/ory/kratos/x"
 	"github.com/ory/x/fetcher"
-	"github.com/ory/x/logrusx"
+	"github.com/ory/x/jsonnetsecure"
 )
 
 var ErrCancel = errors.New("request cancel by JsonNet")
@@ -25,18 +33,30 @@ const (
 	ContentTypeJSON = "application/json"
 )
 
-type Builder struct {
-	r           *retryablehttp.Request
-	log         *logrusx.Logger
-	conf        *Config
-	fetchClient *retryablehttp.Client
-}
+type (
+	Dependencies interface {
+		x.LoggingProvider
+		x.TracingProvider
+		x.HTTPClientProvider
+		jsonnetsecure.VMProvider
+	}
+	Builder struct {
+		r      *retryablehttp.Request
+		Config *Config
+		deps   Dependencies
+	}
+)
 
-func NewBuilder(config json.RawMessage, client *retryablehttp.Client, l *logrusx.Logger) (*Builder, error) {
+func NewBuilder(ctx context.Context, config json.RawMessage, deps Dependencies) (_ *Builder, err error) {
+	_, span := deps.Tracer(ctx).Tracer().Start(ctx, "request.NewBuilder")
+	defer otelx.End(span, &err)
+
 	c, err := parseConfig(config)
 	if err != nil {
 		return nil, err
 	}
+
+	span.SetAttributes(attribute.String("url", c.URL), attribute.String("method", c.Method))
 
 	r, err := retryablehttp.NewRequest(c.Method, c.URL, nil)
 	if err != nil {
@@ -44,15 +64,14 @@ func NewBuilder(config json.RawMessage, client *retryablehttp.Client, l *logrusx
 	}
 
 	return &Builder{
-		r:           r,
-		log:         l,
-		conf:        c,
-		fetchClient: client,
+		r:      r,
+		Config: c,
+		deps:   deps,
 	}, nil
 }
 
 func (b *Builder) addAuth() error {
-	authConfig := b.conf.Auth
+	authConfig := b.Config.Auth
 
 	strategy, err := authStrategy(authConfig.Type, authConfig.Config)
 	if err != nil {
@@ -64,29 +83,32 @@ func (b *Builder) addAuth() error {
 	return nil
 }
 
-func (b *Builder) addBody(body interface{}) error {
+func (b *Builder) addBody(ctx context.Context, body interface{}) error {
+	ctx, span := b.deps.Tracer(ctx).Tracer().Start(ctx, "request.Builder.addBody")
+	defer span.End()
+
 	if isNilInterface(body) {
 		return nil
 	}
 
 	contentType := b.r.Header.Get("Content-Type")
 
-	if b.conf.TemplateURI == "" {
+	if b.Config.TemplateURI == "" {
 		return errors.New("got empty template path for request with body")
 	}
 
-	tpl, err := b.readTemplate()
+	tpl, err := b.readTemplate(ctx)
 	if err != nil {
 		return err
 	}
 
 	switch contentType {
 	case ContentTypeForm:
-		if err := b.addURLEncodedBody(tpl, body); err != nil {
+		if err := b.addURLEncodedBody(ctx, tpl, body); err != nil {
 			return err
 		}
 	case ContentTypeJSON:
-		if err := b.addJSONBody(tpl, body); err != nil {
+		if err := b.addJSONBody(ctx, tpl, body); err != nil {
 			return err
 		}
 	default:
@@ -96,7 +118,7 @@ func (b *Builder) addBody(body interface{}) error {
 	return nil
 }
 
-func (b *Builder) addJSONBody(template *bytes.Buffer, body interface{}) error {
+func (b *Builder) addJSONBody(ctx context.Context, template *bytes.Buffer, body interface{}) error {
 	buf := new(bytes.Buffer)
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
@@ -106,10 +128,16 @@ func (b *Builder) addJSONBody(template *bytes.Buffer, body interface{}) error {
 		return errors.WithStack(err)
 	}
 
-	vm := jsonnet.MakeVM()
+	vm, err := b.deps.JsonnetVM(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
 	vm.TLACode("ctx", buf.String())
 
-	res, err := vm.EvaluateAnonymousSnippet(b.conf.TemplateURI, template.String())
+	res, err := vm.EvaluateAnonymousSnippet(
+		b.Config.TemplateURI,
+		template.String(),
+	)
 	if err != nil {
 		// Unfortunately we can not use errors.As / errors.Is, see:
 		// https://github.com/google/go-jsonnet/issues/592
@@ -121,33 +149,37 @@ func (b *Builder) addJSONBody(template *bytes.Buffer, body interface{}) error {
 	}
 
 	rb := strings.NewReader(res)
-	b.r.Body = io.NopCloser(rb)
-	b.r.ContentLength = int64(rb.Len())
+	if err := b.r.SetBody(io.NopCloser(rb)); err != nil {
+		return errors.WithStack(err)
+	}
 
 	return nil
 }
 
-func (b *Builder) addURLEncodedBody(template *bytes.Buffer, body interface{}) error {
+func (b *Builder) addURLEncodedBody(ctx context.Context, template *bytes.Buffer, body interface{}) error {
 	buf := new(bytes.Buffer)
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "")
 
 	if err := enc.Encode(body); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
-	vm := jsonnet.MakeVM()
+	vm, err := b.deps.JsonnetVM(ctx)
+	if err != nil {
+		return errors.WithStack(err)
+	}
 	vm.TLACode("ctx", buf.String())
 
-	res, err := vm.EvaluateAnonymousSnippet(b.conf.TemplateURI, template.String())
+	res, err := vm.EvaluateAnonymousSnippet(b.Config.TemplateURI, template.String())
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	values := map[string]string{}
 	if err := json.Unmarshal([]byte(res), &values); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	u := url.Values{}
@@ -157,21 +189,23 @@ func (b *Builder) addURLEncodedBody(template *bytes.Buffer, body interface{}) er
 	}
 
 	rb := strings.NewReader(u.Encode())
-	b.r.Body = io.NopCloser(rb)
+	if err := b.r.SetBody(io.NopCloser(rb)); err != nil {
+		return errors.WithStack(err)
+	}
 
 	return nil
 }
 
-func (b *Builder) BuildRequest(body interface{}) (*retryablehttp.Request, error) {
-	b.r.Header = b.conf.Header
+func (b *Builder) BuildRequest(ctx context.Context, body interface{}) (*retryablehttp.Request, error) {
+	b.r.Header = b.Config.Header
 	if err := b.addAuth(); err != nil {
 		return nil, err
 	}
 
 	// According to the HTTP spec any request method, but TRACE is allowed to
 	// have a body. Even this is a bad practice for some of them, like for GET
-	if b.conf.Method != http.MethodTrace {
-		if err := b.addBody(body); err != nil {
+	if b.Config.Method != http.MethodTrace {
+		if err := b.addBody(ctx, body); err != nil {
 			return nil, err
 		}
 	}
@@ -179,22 +213,24 @@ func (b *Builder) BuildRequest(body interface{}) (*retryablehttp.Request, error)
 	return b.r, nil
 }
 
-func (b *Builder) readTemplate() (*bytes.Buffer, error) {
-	templateURI := b.conf.TemplateURI
+func (b *Builder) readTemplate(ctx context.Context) (*bytes.Buffer, error) {
+	templateURI := b.Config.TemplateURI
 
 	if templateURI == "" {
 		return nil, nil
 	}
 
-	f := fetcher.NewFetcher(fetcher.WithClient(b.fetchClient))
+	f := fetcher.NewFetcher(fetcher.WithClient(b.deps.HTTPClient(ctx)))
 
-	tpl, err := f.Fetch(templateURI)
+	tpl, err := f.FetchContext(ctx, templateURI)
 	if errors.Is(err, fetcher.ErrUnknownScheme) {
 		// legacy filepath
 		templateURI = "file://" + templateURI
-		b.log.WithError(err).Warnf("support for filepaths without a 'file://' scheme will be dropped in the next release, please use %s instead in your config", templateURI)
+		b.deps.Logger().WithError(err).Warnf(
+			"support for filepaths without a 'file://' scheme will be dropped in the next release, please use %s instead in your config",
+			templateURI)
 
-		tpl, err = f.Fetch(templateURI)
+		tpl, err = f.FetchContext(ctx, templateURI)
 	}
 	// this handles the first error if it is a known scheme error, or the second fetch error
 	if err != nil {

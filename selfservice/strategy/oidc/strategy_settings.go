@@ -1,11 +1,17 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/ory/x/sqlxx"
 
 	"github.com/tidwall/sjson"
 
@@ -37,6 +43,8 @@ var UnknownConnectionValidationError = &jsonschema.ValidationError{
 	Message: "can not unlink non-existing OpenID Connect connection", InstancePtr: "#/"}
 var ConnectionExistValidationError = &jsonschema.ValidationError{
 	Message: "can not link unknown or already existing OpenID Connect connection", InstancePtr: "#/"}
+var UnlinkAllFirstFactorConnectionsError = &jsonschema.ValidationError{
+	Message: "can not unlink OpenID Connect connection because it is the last remaining first factor credential", InstancePtr: "#/"}
 
 func (s *Strategy) RegisterSettingsRoutes(router *x.RouterPublic) {}
 
@@ -44,8 +52,8 @@ func (s *Strategy) SettingsStrategyID() string {
 	return s.ID().String()
 }
 
-func (s *Strategy) decoderSettings(p *submitSelfServiceSettingsFlowWithOidcMethodBody, r *http.Request) error {
-	ds, err := s.d.Config(r.Context()).DefaultIdentityTraitsSchemaURL()
+func (s *Strategy) decoderSettings(p *updateSettingsFlowWithOidcMethod, r *http.Request) error {
+	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
 	if err != nil {
 		return err
 	}
@@ -83,21 +91,12 @@ func (s *Strategy) linkedProviders(ctx context.Context, r *http.Request, conf *C
 		return nil, errors.WithStack(err)
 	}
 
-	count, err := s.d.IdentityManager().CountActiveFirstFactorCredentials(ctx, confidential)
-	if err != nil {
-		return nil, err
-	}
-
-	if count < 2 {
-		// This means that we're able to remove a connection because it is the last configured credential. If it is
-		// removed, the identity is no longer able to sign in.
-		return nil, nil
-	}
-
 	var result []Provider
 	for _, p := range available.Providers {
 		prov, err := conf.Provider(p.Provider, s.d)
-		if err != nil {
+		if errors.Is(err, herodot.ErrNotFound) {
+			continue
+		} else if err != nil {
 			return nil, err
 		}
 		result = append(result, prov)
@@ -165,19 +164,36 @@ func (s *Strategy) PopulateSettingsMethod(r *http.Request, id *identity.Identity
 	sr.UI.GetNodes().Remove("unlink", "link")
 	sr.UI.SetCSRF(s.d.GenerateCSRFToken(r))
 	for _, l := range linkable {
+		// We do not want to offer to link SSO providers in the settings.
+		if l.Config().OrganizationID != "" {
+			continue
+		}
 		sr.UI.GetNodes().Append(NewLinkNode(l.Config().ID))
 	}
 
-	for _, l := range linked {
-		sr.UI.GetNodes().Append(NewUnlinkNode(l.Config().ID))
+	count, err := s.d.IdentityManager().CountActiveFirstFactorCredentials(r.Context(), confidential)
+	if err != nil {
+		return err
+	}
+
+	if count > 1 {
+		// This means that we're able to remove a connection because it is the last configured credential. If it is
+		// removed, the identity is no longer able to sign in.
+		for _, l := range linked {
+			sr.UI.GetNodes().Append(NewUnlinkNode(l.Config().ID))
+		}
 	}
 
 	return nil
 }
 
-// nolint:deadcode,unused
-// swagger:model submitSelfServiceSettingsFlowWithOidcMethodBody
-type submitSelfServiceSettingsFlowWithOidcMethodBody struct {
+// Update Settings Flow with OpenID Connect Method
+//
+// swagger:model updateSettingsFlowWithOidcMethod
+//
+//nolint:deadcode,unused
+//lint:ignore U1000 Used to generate Swagger and OpenAPI definitions
+type updateSettingsFlowWithOidcMethod struct {
 	// Method
 	//
 	// Should be set to profile when trying to update a profile.
@@ -210,25 +226,36 @@ type submitSelfServiceSettingsFlowWithOidcMethodBody struct {
 	//
 	// in: body
 	Traits json.RawMessage `json:"traits"`
+
+	// UpstreamParameters are the parameters that are passed to the upstream identity provider.
+	//
+	// These parameters are optional and depend on what the upstream identity provider supports.
+	// Supported parameters are:
+	// - `login_hint` (string): The `login_hint` parameter suppresses the account chooser and either pre-fills the email box on the sign-in form, or selects the proper session.
+	// - `hd` (string): The `hd` parameter limits the login/registration process to a Google Organization, e.g. `mycollege.edu`.
+	// - `prompt` (string): The `prompt` specifies whether the Authorization Server prompts the End-User for reauthentication and consent, e.g. `select_account`.
+	//
+	// required: false
+	UpstreamParameters json.RawMessage `json:"upstream_parameters"`
 }
 
-func (p *submitSelfServiceSettingsFlowWithOidcMethodBody) GetFlowID() uuid.UUID {
+func (p *updateSettingsFlowWithOidcMethod) GetFlowID() uuid.UUID {
 	return x.ParseUUID(p.FlowID)
 }
 
-func (p *submitSelfServiceSettingsFlowWithOidcMethodBody) SetFlowID(rid uuid.UUID) {
+func (p *updateSettingsFlowWithOidcMethod) SetFlowID(rid uuid.UUID) {
 	p.FlowID = rid.String()
 }
 
 func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.Flow, ss *session.Session) (*settings.UpdateContext, error) {
-	var p submitSelfServiceSettingsFlowWithOidcMethodBody
+	var p updateSettingsFlowWithOidcMethod
 	if err := s.decoderSettings(&p, r); err != nil {
 		return nil, err
 	}
 
 	ctxUpdate, err := settings.PrepareUpdate(s.d, w, r, f, ss, settings.ContinuityKey(s.SettingsStrategyID()), &p)
 	if errors.Is(err, settings.ErrContinuePreviousAction) {
-		if !s.d.Config(r.Context()).SelfServiceStrategy(s.SettingsStrategyID()).Enabled {
+		if !s.d.Config().SelfServiceStrategy(r.Context(), s.SettingsStrategyID()).Enabled {
 			return nil, errors.WithStack(herodot.ErrNotFound.WithReason(strategy.EndpointDisabledMessage))
 		}
 
@@ -255,7 +282,7 @@ func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.
 		return nil, errors.WithStack(flow.ErrStrategyNotResponsible)
 	}
 
-	if !s.d.Config(r.Context()).SelfServiceStrategy(s.SettingsStrategyID()).Enabled {
+	if !s.d.Config().SelfServiceStrategy(r.Context(), s.SettingsStrategyID()).Enabled {
 		return nil, errors.WithStack(herodot.ErrNotFound.WithReason(strategy.EndpointDisabledMessage))
 	}
 
@@ -312,12 +339,12 @@ func (s *Strategy) isLinkable(r *http.Request, ctxUpdate *settings.UpdateContext
 	return i, nil
 }
 
-func (s *Strategy) initLinkProvider(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithOidcMethodBody) error {
+func (s *Strategy) initLinkProvider(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithOidcMethod) error {
 	if _, err := s.isLinkable(r, ctxUpdate, p.Link); err != nil {
 		return s.handleSettingsError(w, r, ctxUpdate, p, err)
 	}
 
-	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config(r.Context()).SelfServiceFlowSettingsPrivilegedSessionMaxAge()).Before(time.Now()) {
+	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config().SelfServiceFlowSettingsPrivilegedSessionMaxAge(r.Context())).Before(time.Now()) {
 		return s.handleSettingsError(w, r, ctxUpdate, p, errors.WithStack(settings.NewFlowNeedsReAuth()))
 	}
 
@@ -336,9 +363,9 @@ func (s *Strategy) initLinkProvider(w http.ResponseWriter, r *http.Request, ctxU
 		return s.handleSettingsError(w, r, ctxUpdate, p, err)
 	}
 
-	state := x.NewUUID().String()
+	state := generateState(ctxUpdate.Flow.ID.String()).String()
 	if err := s.d.ContinuityManager().Pause(r.Context(), w, r, sessionName,
-		continuity.WithPayload(&authCodeContainer{
+		continuity.WithPayload(&AuthCodeContainer{
 			State:  state,
 			FlowID: ctxUpdate.Flow.ID.String(),
 			Traits: p.Traits,
@@ -347,7 +374,12 @@ func (s *Strategy) initLinkProvider(w http.ResponseWriter, r *http.Request, ctxU
 		return s.handleSettingsError(w, r, ctxUpdate, p, err)
 	}
 
-	codeURL := c.AuthCodeURL(state, provider.AuthCodeURLOptions(req)...)
+	var up map[string]string
+	if err := json.NewDecoder(bytes.NewBuffer(p.UpstreamParameters)).Decode(&up); err != nil {
+		return err
+	}
+
+	codeURL := c.AuthCodeURL(state, append(UpstreamParameters(provider, up), provider.AuthCodeURLOptions(req)...)...)
 	if x.IsJSONRequest(r) {
 		s.d.Writer().WriteError(w, r, flow.NewBrowserLocationChangeRequiredError(codeURL))
 	} else {
@@ -358,9 +390,9 @@ func (s *Strategy) initLinkProvider(w http.ResponseWriter, r *http.Request, ctxU
 }
 
 func (s *Strategy) linkProvider(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, token *oauth2.Token, claims *Claims, provider Provider) error {
-	p := &submitSelfServiceSettingsFlowWithOidcMethodBody{
+	p := &updateSettingsFlowWithOidcMethod{
 		Link: provider.Config().ID, FlowID: ctxUpdate.Flow.ID.String()}
-	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config(r.Context()).SelfServiceFlowSettingsPrivilegedSessionMaxAge()).Before(time.Now()) {
+	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config().SelfServiceFlowSettingsPrivilegedSessionMaxAge(r.Context())).Before(time.Now()) {
 		return s.handleSettingsError(w, r, ctxUpdate, p, errors.WithStack(settings.NewFlowNeedsReAuth()))
 	}
 
@@ -371,46 +403,25 @@ func (s *Strategy) linkProvider(w http.ResponseWriter, r *http.Request, ctxUpdat
 
 	var it string
 	if idToken, ok := token.Extra("id_token").(string); ok {
-		if it, err = s.d.Cipher().Encrypt(r.Context(), []byte(idToken)); err != nil {
+		if it, err = s.d.Cipher(r.Context()).Encrypt(r.Context(), []byte(idToken)); err != nil {
 			return s.handleSettingsError(w, r, ctxUpdate, p, err)
 		}
 	}
 
-	cat, err := s.d.Cipher().Encrypt(r.Context(), []byte(token.AccessToken))
+	cat, err := s.d.Cipher(r.Context()).Encrypt(r.Context(), []byte(token.AccessToken))
 	if err != nil {
 		return s.handleSettingsError(w, r, ctxUpdate, p, err)
 	}
 
-	crt, err := s.d.Cipher().Encrypt(r.Context(), []byte(token.RefreshToken))
+	crt, err := s.d.Cipher(r.Context()).Encrypt(r.Context(), []byte(token.RefreshToken))
 	if err != nil {
 		return s.handleSettingsError(w, r, ctxUpdate, p, err)
 	}
 
-	var conf identity.CredentialsOIDC
-	creds, err := i.ParseCredentials(s.ID(), &conf)
-	if errors.Is(err, herodot.ErrNotFound) {
-		var err error
-		if creds, err = identity.NewCredentialsOIDC(it, cat, crt, provider.Config().ID, claims.Subject); err != nil {
-			return s.handleSettingsError(w, r, ctxUpdate, p, err)
-		}
-	} else if err != nil {
+	if err := s.linkCredentials(r.Context(), i, it, cat, crt, provider.Config().ID, claims.Subject, provider.Config().OrganizationID); err != nil {
 		return s.handleSettingsError(w, r, ctxUpdate, p, err)
-	} else {
-		creds.Identifiers = append(creds.Identifiers, identity.OIDCUniqueID(provider.Config().ID, claims.Subject))
-		conf.Providers = append(conf.Providers, identity.CredentialsOIDCProvider{
-			Subject: claims.Subject, Provider: provider.Config().ID,
-			InitialAccessToken:  cat,
-			InitialRefreshToken: crt,
-			InitialIDToken:      it,
-		})
-
-		creds.Config, err = json.Marshal(conf)
-		if err != nil {
-			return s.handleSettingsError(w, r, ctxUpdate, p, err)
-		}
 	}
 
-	i.Credentials[s.ID()] = *creds
 	if err := s.d.SettingsHookExecutor().PostSettingsHook(w, r, s.SettingsStrategyID(), ctxUpdate, i, settings.WithCallback(func(ctxUpdate *settings.UpdateContext) error {
 		return s.PopulateSettingsMethod(r, ctxUpdate.Session.Identity, ctxUpdate.Flow)
 	})); err != nil {
@@ -420,8 +431,8 @@ func (s *Strategy) linkProvider(w http.ResponseWriter, r *http.Request, ctxUpdat
 	return nil
 }
 
-func (s *Strategy) unlinkProvider(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithOidcMethodBody) error {
-	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config(r.Context()).SelfServiceFlowSettingsPrivilegedSessionMaxAge()).Before(time.Now()) {
+func (s *Strategy) unlinkProvider(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithOidcMethod) error {
+	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config().SelfServiceFlowSettingsPrivilegedSessionMaxAge(r.Context())).Before(time.Now()) {
 		return s.handleSettingsError(w, r, ctxUpdate, p, errors.WithStack(settings.NewFlowNeedsReAuth()))
 	}
 
@@ -443,7 +454,16 @@ func (s *Strategy) unlinkProvider(w http.ResponseWriter, r *http.Request, ctxUpd
 	var cc identity.CredentialsOIDC
 	creds, err := i.ParseCredentials(s.ID(), &cc)
 	if err != nil {
-		return s.handleSettingsError(w, r, ctxUpdate, p, errors.WithStack(UnknownConnectionValidationError))
+		return s.handleSettingsError(w, r, ctxUpdate, p, err)
+	}
+
+	count, err := s.d.IdentityManager().CountActiveFirstFactorCredentials(r.Context(), i)
+	if err != nil {
+		return s.handleSettingsError(w, r, ctxUpdate, p, err)
+	}
+
+	if count < 2 {
+		return s.handleSettingsError(w, r, ctxUpdate, p, errors.WithStack(UnlinkAllFirstFactorConnectionsError))
 	}
 
 	var found bool
@@ -483,7 +503,7 @@ func (s *Strategy) unlinkProvider(w http.ResponseWriter, r *http.Request, ctxUpd
 	return errors.WithStack(flow.ErrCompletedByStrategy)
 }
 
-func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithOidcMethodBody, err error) error {
+func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithOidcMethod, err error) error {
 	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) {
 		if err := s.d.ContinuityManager().Pause(r.Context(), w, r,
 			settings.ContinuityKey(s.SettingsStrategyID()), settings.ContinuityOptions(p, ctxUpdate.Session.Identity)...); err != nil {
@@ -497,4 +517,35 @@ func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, c
 	}
 
 	return err
+}
+
+func (s *Strategy) Link(ctx context.Context, i *identity.Identity, credentialsConfig sqlxx.JSONRawMessage) error {
+	var credentialsOIDCConfig identity.CredentialsOIDC
+	if err := json.Unmarshal(credentialsConfig, &credentialsOIDCConfig); err != nil {
+		return err
+	}
+	if len(credentialsOIDCConfig.Providers) != 1 {
+		return errors.New("No oidc provider was set")
+	}
+	var credentialsOIDCProvider = credentialsOIDCConfig.Providers[0]
+
+	if err := s.linkCredentials(
+		ctx,
+		i,
+		credentialsOIDCProvider.InitialIDToken,
+		credentialsOIDCProvider.InitialAccessToken,
+		credentialsOIDCProvider.InitialRefreshToken,
+		credentialsOIDCProvider.Provider,
+		credentialsOIDCProvider.Subject,
+		credentialsOIDCProvider.Organization,
+	); err != nil {
+		return err
+	}
+
+	options := []identity.ManagerOption{identity.ManagerAllowWriteProtectedTraits}
+	if err := s.d.IdentityManager().Update(ctx, i, options...); err != nil {
+		return err
+	}
+
+	return nil
 }

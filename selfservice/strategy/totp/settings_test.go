@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package totp_test
 
 import (
@@ -16,7 +19,7 @@ import (
 	"github.com/pquerna/otp"
 	stdtotp "github.com/pquerna/otp/totp"
 
-	kratos "github.com/ory/kratos-client-go"
+	kratos "github.com/ory/kratos/internal/httpclient"
 	"github.com/ory/kratos/selfservice/strategy/totp"
 	"github.com/ory/kratos/ui/node"
 
@@ -38,11 +41,12 @@ import (
 )
 
 func TestCompleteSettings(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword), map[string]interface{}{"enabled": false})
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+".profile", map[string]interface{}{"enabled": false})
-	conf.MustSet(config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeTOTP), map[string]interface{}{"enabled": true})
-	conf.MustSet(config.ViperKeySelfServiceSettingsRequiredAAL, "aal1")
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypePassword), map[string]interface{}{"enabled": false})
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+".profile", map[string]interface{}{"enabled": false})
+	conf.MustSet(ctx, config.ViperKeySelfServiceStrategyConfig+"."+string(identity.CredentialsTypeTOTP), map[string]interface{}{"enabled": true})
+	conf.MustSet(ctx, config.ViperKeySelfServiceSettingsRequiredAAL, "aal1")
 
 	router := x.NewRouterPublic()
 	publicTS, _ := testhelpers.NewKratosServerWithRouters(t, reg, router, x.NewRouterAdmin())
@@ -52,10 +56,10 @@ func TestCompleteSettings(t *testing.T) {
 	_ = testhelpers.NewRedirSessionEchoTS(t, reg)
 	loginTS := testhelpers.NewLoginUIFlowEchoServer(t, reg)
 
-	conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1m")
+	conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1m")
 
 	testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/settings.schema.json")
-	conf.MustSet(config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
+	conf.MustSet(ctx, config.ViperKeySecretsDefault, []string{"not-a-secure-session-key"})
 
 	t.Run("case=device unlinking is available when identity has totp", func(t *testing.T) {
 		id, _, _ := createIdentity(t, reg)
@@ -138,13 +142,13 @@ func TestCompleteSettings(t *testing.T) {
 	})
 
 	t.Run("type=can not unlink without privileged session", func(t *testing.T) {
-		conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
+		conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
 		t.Cleanup(func() {
-			conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
+			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
 		})
 
 		id, _, key := createIdentity(t, reg)
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("totp_unlink", "true")
 		}
 
@@ -180,13 +184,13 @@ func TestCompleteSettings(t *testing.T) {
 	})
 
 	t.Run("type=can not set up new totp device without privileged session", func(t *testing.T) {
-		conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
+		conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "1ns")
 		t.Cleanup(func() {
-			conf.MustSet(config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
+			conf.MustSet(ctx, config.ViperKeySelfServiceSettingsPrivilegedAuthenticationAfter, "5m")
 		})
 
 		id := createIdentityWithoutTOTP(t, reg)
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set(node.TOTPCode, "111111")
 		}
 
@@ -221,7 +225,7 @@ func TestCompleteSettings(t *testing.T) {
 	})
 
 	t.Run("type=unlink TOTP device", func(t *testing.T) {
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set("totp_unlink", "true")
 		}
 
@@ -235,7 +239,7 @@ func TestCompleteSettings(t *testing.T) {
 			actual, res := doAPIFlow(t, payload, id)
 			assert.Equal(t, http.StatusOK, res.StatusCode)
 			assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
-			assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), actual)
+			assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), actual)
 			checkIdentity(t, id)
 		})
 
@@ -244,7 +248,7 @@ func TestCompleteSettings(t *testing.T) {
 			actual, res := doBrowserFlow(t, true, payload, id)
 			assert.Equal(t, http.StatusOK, res.StatusCode)
 			assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
-			assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), actual)
+			assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), actual)
 			checkIdentity(t, id)
 		})
 
@@ -253,13 +257,13 @@ func TestCompleteSettings(t *testing.T) {
 			actual, res := doBrowserFlow(t, false, payload, id)
 			assert.Equal(t, http.StatusOK, res.StatusCode)
 			assert.Contains(t, res.Request.URL.String(), uiTS.URL)
-			assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), actual)
+			assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), actual)
 			checkIdentity(t, id)
 		})
 	})
 
 	t.Run("type=set up TOTP device but code is incorrect", func(t *testing.T) {
-		var payload = func(v url.Values) {
+		payload := func(v url.Values) {
 			v.Set(node.TOTPCode, "111111")
 		}
 
@@ -300,7 +304,7 @@ func TestCompleteSettings(t *testing.T) {
 		checkIdentity := func(t *testing.T, id *identity.Identity, key string) {
 			i, cred, err := reg.PrivilegedIdentityPool().FindByCredentialsIdentifier(context.Background(), identity.CredentialsTypeTOTP, id.ID.String())
 			require.NoError(t, err)
-			var c totp.CredentialsConfig
+			var c identity.CredentialsTOTPConfig
 			require.NoError(t, json.Unmarshal(cred.Config, &c))
 			actual, err := otp.NewKeyFromURL(c.TOTPURL)
 			require.NoError(t, err)
@@ -308,7 +312,7 @@ func TestCompleteSettings(t *testing.T) {
 			assert.Contains(t, c.TOTPURL, gjson.GetBytes(i.Traits, "subject").String())
 		}
 
-		run := func(t *testing.T, isAPI, isSPA bool, id *identity.Identity, hc *http.Client, f *kratos.SelfServiceSettingsFlow) {
+		run := func(t *testing.T, isAPI, isSPA bool, id *identity.Identity, hc *http.Client, f *kratos.SettingsFlow) {
 			values := testhelpers.SDKFormFieldsToURLValues(f.Ui.Nodes)
 
 			nodes, err := json.Marshal(f.Ui.Nodes)
@@ -328,10 +332,10 @@ func TestCompleteSettings(t *testing.T) {
 
 			if isAPI || isSPA {
 				assert.Contains(t, res.Request.URL.String(), publicTS.URL+settings.RouteSubmitFlow)
-				assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), actual)
+				assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), actual)
 			} else {
 				assert.Contains(t, res.Request.URL.String(), uiTS.URL)
-				assert.EqualValues(t, settings.StateSuccess, gjson.Get(actual, "state").String(), actual)
+				assert.EqualValues(t, flow.StateSuccess, gjson.Get(actual, "state").String(), actual)
 			}
 
 			actualFlow, err := reg.SettingsFlowPersister().GetSettingsFlow(context.Background(), uuid.FromStringOrNil(f.Id))

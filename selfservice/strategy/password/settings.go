@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package password
 
 import (
@@ -30,8 +33,10 @@ func (s *Strategy) SettingsStrategyID() string {
 	return identity.CredentialsTypePassword.String()
 }
 
-// swagger:model submitSelfServiceSettingsFlowWithPasswordMethodBody
-type submitSelfServiceSettingsFlowWithPasswordMethodBody struct {
+// Update Settings Flow with Password Method
+//
+// swagger:model updateSettingsFlowWithPasswordMethod
+type updateSettingsFlowWithPasswordMethod struct {
 	// Password is the updated password
 	//
 	// required: true
@@ -53,16 +58,16 @@ type submitSelfServiceSettingsFlowWithPasswordMethodBody struct {
 	Flow string `json:"flow"`
 }
 
-func (p *submitSelfServiceSettingsFlowWithPasswordMethodBody) GetFlowID() uuid.UUID {
+func (p *updateSettingsFlowWithPasswordMethod) GetFlowID() uuid.UUID {
 	return x.ParseUUID(p.Flow)
 }
 
-func (p *submitSelfServiceSettingsFlowWithPasswordMethodBody) SetFlowID(rid uuid.UUID) {
+func (p *updateSettingsFlowWithPasswordMethod) SetFlowID(rid uuid.UUID) {
 	p.Flow = rid.String()
 }
 
 func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.Flow, ss *session.Session) (*settings.UpdateContext, error) {
-	var p submitSelfServiceSettingsFlowWithPasswordMethodBody
+	var p updateSettingsFlowWithPasswordMethod
 	ctxUpdate, err := settings.PrepareUpdate(s.d, w, r, f, ss, settings.ContinuityKey(s.SettingsStrategyID()), &p)
 	if errors.Is(err, settings.ErrContinuePreviousAction) {
 		return ctxUpdate, s.continueSettingsFlow(w, r, ctxUpdate, &p)
@@ -70,7 +75,7 @@ func (s *Strategy) Settings(w http.ResponseWriter, r *http.Request, f *settings.
 		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, &p, err)
 	}
 
-	if err := flow.MethodEnabledAndAllowedFromRequest(r, s.SettingsStrategyID(), s.d); err != nil {
+	if err := flow.MethodEnabledAndAllowedFromRequest(r, f.GetFlowName(), s.SettingsStrategyID(), s.d); err != nil {
 		return ctxUpdate, s.handleSettingsError(w, r, ctxUpdate, &p, err)
 	}
 
@@ -102,17 +107,17 @@ func (s *Strategy) decodeSettingsFlow(r *http.Request, dest interface{}) error {
 
 func (s *Strategy) continueSettingsFlow(
 	w http.ResponseWriter, r *http.Request,
-	ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithPasswordMethodBody,
+	ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithPasswordMethod,
 ) error {
-	if err := flow.MethodEnabledAndAllowed(r.Context(), s.SettingsStrategyID(), p.Method, s.d); err != nil {
+	if err := flow.MethodEnabledAndAllowed(r.Context(), flow.SettingsFlow, s.SettingsStrategyID(), p.Method, s.d); err != nil {
 		return err
 	}
 
-	if err := flow.EnsureCSRF(s.d, r, ctxUpdate.Flow.Type, s.d.Config(r.Context()).DisableAPIFlowEnforcement(), s.d.GenerateCSRFToken, p.CSRFToken); err != nil {
+	if err := flow.EnsureCSRF(s.d, r, ctxUpdate.Flow.Type, s.d.Config().DisableAPIFlowEnforcement(r.Context()), s.d.GenerateCSRFToken, p.CSRFToken); err != nil {
 		return err
 	}
 
-	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config(r.Context()).SelfServiceFlowSettingsPrivilegedSessionMaxAge()).Before(time.Now()) {
+	if ctxUpdate.Session.AuthenticatedAt.Add(s.d.Config().SelfServiceFlowSettingsPrivilegedSessionMaxAge(r.Context())).Before(time.Now()) {
 		return errors.WithStack(settings.NewFlowNeedsReAuth())
 	}
 
@@ -120,24 +125,37 @@ func (s *Strategy) continueSettingsFlow(
 		return schema.NewRequiredError("#/password", "password")
 	}
 
-	hpw, err := s.d.Hasher().Generate(r.Context(), []byte(p.Password))
-	if err != nil {
-		return err
-	}
-
-	co, err := json.Marshal(&identity.CredentialsPassword{HashedPassword: string(hpw)})
-	if err != nil {
-		return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to encode password options to JSON: %s", err))
-	}
+	hpw, errC := make(chan []byte), make(chan error)
+	go func() {
+		defer close(hpw)
+		defer close(errC)
+		h, err := s.d.Hasher(r.Context()).Generate(r.Context(), []byte(p.Password))
+		if err != nil {
+			errC <- err
+			return
+		}
+		hpw <- h
+	}()
 
 	i, err := s.d.PrivilegedIdentityPool().GetIdentityConfidential(r.Context(), ctxUpdate.Session.Identity.ID)
 	if err != nil {
 		return err
 	}
 
-	i.UpsertCredentialsConfig(s.ID(), co, 0)
+	i.UpsertCredentialsConfig(s.ID(), []byte("{}"), 0)
 	if err := s.validateCredentials(r.Context(), i, p.Password); err != nil {
 		return err
+	}
+
+	select {
+	case err := <-errC:
+		return err
+	case h := <-hpw:
+		co, err := json.Marshal(&identity.CredentialsPassword{HashedPassword: string(h)})
+		if err != nil {
+			return errors.WithStack(herodot.ErrInternalServerError.WithReasonf("Unable to encode password options to JSON: %s", err))
+		}
+		i.UpsertCredentialsConfig(s.ID(), co, 0)
 	}
 	ctxUpdate.UpdateIdentity(i)
 
@@ -152,7 +170,7 @@ func (s *Strategy) PopulateSettingsMethod(r *http.Request, _ *identity.Identity,
 	return nil
 }
 
-func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithPasswordMethodBody, err error) error {
+func (s *Strategy) handleSettingsError(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithPasswordMethod, err error) error {
 	// Do not pause flow if the flow type is an API flow as we can't save cookies in those flows.
 	if e := new(settings.FlowNeedsReAuth); errors.As(err, &e) && ctxUpdate.Flow != nil && ctxUpdate.Flow.Type == flow.TypeBrowser {
 		if err := s.d.ContinuityManager().Pause(r.Context(), w, r, settings.ContinuityKey(s.SettingsStrategyID()), settings.ContinuityOptions(p, ctxUpdate.GetSessionIdentity())...); err != nil {

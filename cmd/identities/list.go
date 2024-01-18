@@ -1,58 +1,65 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package identities
 
 import (
-	"fmt"
-
 	"github.com/spf13/cobra"
+
+	"github.com/ory/x/pagination/keysetpagination"
 
 	"github.com/ory/kratos/cmd/cliclient"
 	"github.com/ory/x/cmdx"
 )
 
-func NewListCmd(root *cobra.Command) *cobra.Command {
+func NewListCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
 		Short:   "List resources",
 	}
-	c.AddCommand(NewListIdentitiesCmd(root))
+	c.AddCommand(NewListIdentitiesCmd())
 	cliclient.RegisterClientFlags(c.PersistentFlags())
 	cmdx.RegisterFormatFlags(c.PersistentFlags())
 	return c
 }
 
-func NewListIdentitiesCmd(root *cobra.Command) *cobra.Command {
-	return &cobra.Command{
-		Use:     "identities [<page> <per-page>]",
+func NewListIdentitiesCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:     "identities",
 		Short:   "List identities",
-		Long:    "List identities (paginated)",
-		Example: fmt.Sprintf("%[1]s ls identities 100 1", root.Use),
+		Long:    "Return a list of identities.",
+		Example: "{{ .CommandPath }} --page-size 100",
 		Args:    cmdx.ZeroOrTwoArgs,
-		Aliases: []string{"ls"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := cliclient.NewClient(cmd)
 			if err != nil {
 				return err
 			}
 
-			req := c.V0alpha2Api.AdminListIdentities(cmd.Context())
-			if len(args) == 2 {
-				page, perPage, err := cmdx.ParsePaginationArgs(cmd, args[0], args[1])
-				if err != nil {
-					return err
-				}
-
-				req = req.Page(page)
-				req = req.PerPage(perPage)
+			req := c.IdentityApi.ListIdentities(cmd.Context())
+			page, perPage, err := cmdx.ParseTokenPaginationArgs(cmd)
+			if err != nil {
+				return err
 			}
 
-			identities, _, err := req.Execute()
+			req = req.PageToken(page)
+			req = req.PageSize(int64(perPage))
+
+			identities, res, err := req.Execute()
 			if err != nil {
 				return cmdx.PrintOpenAPIError(cmd, err)
 			}
 
-			cmdx.PrintTable(cmd, &outputIdentityCollection{identities: identities})
+			pages := keysetpagination.ParseHeader(res)
+			cmdx.PrintTable(cmd, &outputIdentityCollection{
+				Identities:       identities,
+				NextPageToken:    pages.NextToken,
+				includePageToken: true,
+			})
 			return nil
 		},
 	}
+	cmdx.RegisterTokenPaginationFlags(c)
+	return c
 }
