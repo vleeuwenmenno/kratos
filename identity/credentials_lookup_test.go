@@ -15,7 +15,7 @@ import (
 )
 
 func TestToNode(t *testing.T) {
-	c := identity.CredentialsConfig{LookupSecrets: []identity.LookupSecret{
+	c := identity.CredentialsLookupConfig{LookupSecrets: []identity.LookupSecret{
 		{Code: "foo", UsedAt: sqlxx.NullTime(time.Unix(1629199958, 0).UTC())},
 		{Code: "bar"},
 		{Code: "baz"},

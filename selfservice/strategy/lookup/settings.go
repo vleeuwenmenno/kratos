@@ -246,7 +246,7 @@ func (s *Strategy) continueSettingsFlowReveal(w http.ResponseWriter, r *http.Req
 	return nil
 }
 
-func (s *Strategy) continueSettingsFlowRegenerate(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *submitSelfServiceSettingsFlowWithLookupMethodBody) error {
+func (s *Strategy) continueSettingsFlowRegenerate(w http.ResponseWriter, r *http.Request, ctxUpdate *settings.UpdateContext, p *updateSettingsFlowWithLookupMethod) error {
 	codes := make([]identity.LookupSecret, numCodes)
 	for k := range codes {
 		codes[k] = identity.LookupSecret{Code: randx.MustString(8, randx.AlphaLowerNum)}

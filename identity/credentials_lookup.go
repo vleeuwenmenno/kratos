@@ -12,13 +12,13 @@ import (
 	"github.com/ory/x/sqlxx"
 )
 
-// CredentialsConfig is the struct that is being used as part of the identity credentials.
-type CredentialsConfig struct {
+// CredentialsLookupConfig is the struct that is being used as part of the identity credentials.
+type CredentialsLookupConfig struct {
 	// LookupSecrets is a list of recovery codes.
 	LookupSecrets []LookupSecret `json:"lookup_secrets"`
 }
 
-func (c *CredentialsConfig) ToNode() *node.Node {
+func (c *CredentialsLookupConfig) ToNode() *node.Node {
 	messages := make([]text.Message, len(c.LookupSecrets))
 	formatted := make([]string, len(c.LookupSecrets))
 	for k, code := range c.LookupSecrets {

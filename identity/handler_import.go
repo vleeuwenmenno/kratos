@@ -103,22 +103,22 @@ func (h *Handler) importOIDCCredentials(_ context.Context, i *Identity, creds *A
 }
 
 func (h *Handler) importTOTPCredentials(_ context.Context, i *Identity, creds *AdminIdentityImportCredentialsTOTP) error {
-	return i.SetCredentialsWithConfig(CredentialsTypeTOTP, Credentials{Identifiers: []string{i.ID.String()}}, CredentialsTOTP{TOTPURL: creds.Config.TOTPURL})
+	return i.SetCredentialsWithConfig(CredentialsTypeTOTP, Credentials{Identifiers: []string{i.ID.String()}}, CredentialsTOTPConfig{TOTPURL: creds.Config.TOTPURL})
 }
 
 func (h *Handler) importLookupCredentials(_ context.Context, i *Identity, creds *AdminIdentityImportCredentialsLookup) error {
-	var target CredentialsLookupSecrets
+	var target CredentialsLookupConfig
 	c, ok := i.GetCredentials(CredentialsTypeLookup)
 	if !ok {
-		var lookupSecrets []CredentialsLookupSecret
+		var lookupSecrets []LookupSecret
 		for _, s := range creds.Config.LookupSecrets {
-			lookupSecrets = append(lookupSecrets, CredentialsLookupSecret(s))
+			lookupSecrets = append(lookupSecrets, LookupSecret(s))
 		}
 
 		return i.SetCredentialsWithConfig(
 			CredentialsTypeLookup,
 			Credentials{Identifiers: []string{i.ID.String()}},
-			CredentialsLookupSecrets{LookupSecrets: lookupSecrets},
+			CredentialsLookupConfig{LookupSecrets: lookupSecrets},
 		)
 	}
 
@@ -128,7 +128,7 @@ func (h *Handler) importLookupCredentials(_ context.Context, i *Identity, creds 
 
 	c.Identifiers = []string{i.ID.String()}
 	for _, s := range creds.Config.LookupSecrets {
-		target.LookupSecrets = append(target.LookupSecrets, CredentialsLookupSecret(s))
+		target.LookupSecrets = append(target.LookupSecrets, LookupSecret(s))
 	}
 
 	return i.SetCredentialsWithConfig(CredentialsTypeLookup, *c, &target)

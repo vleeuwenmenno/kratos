@@ -330,8 +330,8 @@ func TestHandler(t *testing.T) {
 		})
 
 		t.Run("with totp credentials", func(t *testing.T) {
-			res := send(t, adminTS, "POST", "/identities", http.StatusCreated, identity.AdminCreateIdentityBody{Traits: []byte(`{"email": "import-7@ory.sh"}`),
-				Credentials: &identity.AdminIdentityImportCredentials{
+			res := send(t, adminTS, "POST", "/identities", http.StatusCreated, identity.CreateIdentityBody{Traits: []byte(`{"email": "import-7@ory.sh"}`),
+				Credentials: &identity.IdentityWithCredentials{
 					TOTP: &identity.AdminIdentityImportCredentialsTOTP{
 						Config: identity.AdminIdentityImportCredentialsTOTPConfig{
 							TOTPURL: "otpauth://totp/ory:import-7@ory.sh?secret=JBSWY3DPEHPK3PXP&issuer=ory",
@@ -347,8 +347,8 @@ func TestHandler(t *testing.T) {
 		})
 
 		t.Run("with lookup credentials", func(t *testing.T) {
-			res := send(t, adminTS, "POST", "/identities", http.StatusCreated, identity.AdminCreateIdentityBody{Traits: []byte(`{"email": "import-8@ory.sh"}`),
-				Credentials: &identity.AdminIdentityImportCredentials{
+			res := send(t, adminTS, "POST", "/identities", http.StatusCreated, identity.CreateIdentityBody{Traits: []byte(`{"email": "import-8@ory.sh"}`),
+				Credentials: &identity.IdentityWithCredentials{
 					Lookup: &identity.AdminIdentityImportCredentialsLookup{
 						Config: identity.AdminIdentityImportCredentialsLookupConfig{
 							LookupSecrets: []identity.AdminIdentityImportCredentialsLookupSecret{
