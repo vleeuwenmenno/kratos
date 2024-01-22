@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package identities
 
 import (
@@ -41,7 +44,10 @@ func NewValidateIdentityCmd() *cobra.Command {
 It validates against the payload of the API and the identity schema as configured in Ory Kratos.
 Identities can be supplied via STD_IN or JSON files containing a single or an array of identities.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c := cliclient.NewClient(cmd)
+			c, err := cliclient.NewClient(cmd)
+			if err != nil {
+				return err
+			}
 
 			is, err := readIdentities(cmd, args)
 			if err != nil {
@@ -50,7 +56,7 @@ Identities can be supplied via STD_IN or JSON files containing a single or an ar
 
 			for src, i := range is {
 				err = ValidateIdentity(cmd, src, i, func(ctx context.Context, id string) (map[string]interface{}, *http.Response, error) {
-					return c.V0alpha2Api.GetJsonSchema(ctx, id).Execute()
+					return c.IdentityApi.GetIdentitySchema(ctx, id).Execute()
 				})
 				if err != nil {
 					return err
@@ -67,7 +73,7 @@ Identities can be supplied via STD_IN or JSON files containing a single or an ar
 
 var schemas = make(map[string]*jsonschema.Schema)
 
-const createIdentityPath = "api.json#/components/schemas/adminCreateIdentityBody"
+const createIdentityPath = "api.json#/components/schemas/createIdentityBody"
 
 type SchemaGetter = func(ctx context.Context, id string) (map[string]interface{}, *http.Response, error)
 

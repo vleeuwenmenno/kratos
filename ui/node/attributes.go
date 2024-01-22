@@ -1,23 +1,39 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package node
 
 import "github.com/ory/kratos/text"
 
 const (
-	InputAttributeTypeText          InputAttributeType = "text"
-	InputAttributeTypePassword      InputAttributeType = "password"
-	InputAttributeTypeNumber        InputAttributeType = "number"
-	InputAttributeTypeCheckbox      InputAttributeType = "checkbox"
-	InputAttributeTypeHidden        InputAttributeType = "hidden"
-	InputAttributeTypeEmail         InputAttributeType = "email"
-	InputAttributeTypeSubmit        InputAttributeType = "submit"
-	InputAttributeTypeButton        InputAttributeType = "button"
-	InputAttributeTypeDateTimeLocal InputAttributeType = "datetime-local"
-	InputAttributeTypeDate          InputAttributeType = "date"
-	InputAttributeTypeURI           InputAttributeType = "url"
+	InputAttributeTypeText          UiNodeInputAttributeType = "text"
+	InputAttributeTypePassword      UiNodeInputAttributeType = "password"
+	InputAttributeTypeNumber        UiNodeInputAttributeType = "number"
+	InputAttributeTypeCheckbox      UiNodeInputAttributeType = "checkbox"
+	InputAttributeTypeHidden        UiNodeInputAttributeType = "hidden"
+	InputAttributeTypeEmail         UiNodeInputAttributeType = "email"
+	InputAttributeTypeTel           UiNodeInputAttributeType = "tel"
+	InputAttributeTypeSubmit        UiNodeInputAttributeType = "submit"
+	InputAttributeTypeButton        UiNodeInputAttributeType = "button"
+	InputAttributeTypeDateTimeLocal UiNodeInputAttributeType = "datetime-local"
+	InputAttributeTypeDate          UiNodeInputAttributeType = "date"
+	InputAttributeTypeURI           UiNodeInputAttributeType = "url"
 )
 
-// swagger:model uiNodeInputAttributeType
-type InputAttributeType string
+const (
+	InputAttributeAutocompleteEmail           UiNodeInputAttributeAutocomplete = "email"
+	InputAttributeAutocompleteTel             UiNodeInputAttributeAutocomplete = "tel"
+	InputAttributeAutocompleteUrl             UiNodeInputAttributeAutocomplete = "url"
+	InputAttributeAutocompleteCurrentPassword UiNodeInputAttributeAutocomplete = "current-password"
+	InputAttributeAutocompleteNewPassword     UiNodeInputAttributeAutocomplete = "new-password"
+	InputAttributeAutocompleteOneTimeCode     UiNodeInputAttributeAutocomplete = "one-time-code"
+)
+
+// swagger:enum UiNodeInputAttributeType
+type UiNodeInputAttributeType string
+
+// swagger:enum UiNodeInputAttributeAutocomplete
+type UiNodeInputAttributeAutocomplete string
 
 // Attributes represents a list of attributes (e.g. `href="foo"` for links).
 //
@@ -51,13 +67,16 @@ type InputAttributes struct {
 	// The input's element type.
 	//
 	// required: true
-	Type InputAttributeType `json:"type" faker:"-"`
+	Type UiNodeInputAttributeType `json:"type" faker:"-"`
 
 	// The input's value.
 	FieldValue interface{} `json:"value,omitempty" faker:"string"`
 
 	// Mark this input field as required.
 	Required bool `json:"required,omitempty"`
+
+	// The autocomplete attribute for the input.
+	Autocomplete UiNodeInputAttributeAutocomplete `json:"autocomplete,omitempty"`
 
 	// The input's label text.
 	Label *text.Message `json:"label,omitempty"`
@@ -75,10 +94,10 @@ type InputAttributes struct {
 	OnClick string `json:"onclick,omitempty"`
 
 	// NodeType represents this node's types. It is a mirror of `node.type` and
-	// is primarily used to allow compatibility with OpenAPI 3.0.
+	// is primarily used to allow compatibility with OpenAPI 3.0.  In this struct it technically always is "input".
 	//
 	// required: true
-	NodeType UiNodeType `json:"node_type"`
+	NodeType string `json:"node_type"`
 }
 
 // ImageAttributes represents the attributes of an image node.
@@ -107,10 +126,10 @@ type ImageAttributes struct {
 	Height int `json:"height"`
 
 	// NodeType represents this node's types. It is a mirror of `node.type` and
-	// is primarily used to allow compatibility with OpenAPI 3.0.
+	// is primarily used to allow compatibility with OpenAPI 3.0.  In this struct it technically always is "img".
 	//
 	// required: true
-	NodeType UiNodeType `json:"node_type"`
+	NodeType string `json:"node_type"`
 }
 
 // AnchorAttributes represents the attributes of an anchor node.
@@ -134,14 +153,13 @@ type AnchorAttributes struct {
 	Identifier string `json:"id"`
 
 	// NodeType represents this node's types. It is a mirror of `node.type` and
-	// is primarily used to allow compatibility with OpenAPI 3.0.
+	// is primarily used to allow compatibility with OpenAPI 3.0.  In this struct it technically always is "a".
 	//
 	// required: true
-	NodeType UiNodeType `json:"node_type"`
+	NodeType string `json:"node_type"`
 }
 
 // TextAttributes represents the attributes of a text node.
-//
 //
 // swagger:model uiNodeTextAttributes
 type TextAttributes struct {
@@ -156,10 +174,10 @@ type TextAttributes struct {
 	Identifier string `json:"id"`
 
 	// NodeType represents this node's types. It is a mirror of `node.type` and
-	// is primarily used to allow compatibility with OpenAPI 3.0.
+	// is primarily used to allow compatibility with OpenAPI 3.0.  In this struct it technically always is "text".
 	//
 	// required: true
-	NodeType UiNodeType `json:"node_type"`
+	NodeType string `json:"node_type"`
 }
 
 // ScriptAttributes represent script nodes which load javascript.
@@ -211,10 +229,10 @@ type ScriptAttributes struct {
 	Nonce string `json:"nonce"`
 
 	// NodeType represents this node's types. It is a mirror of `node.type` and
-	// is primarily used to allow compatibility with OpenAPI 3.0.
+	// is primarily used to allow compatibility with OpenAPI 3.0. In this struct it technically always is "script".
 	//
 	// required: true
-	NodeType UiNodeType `json:"node_type"`
+	NodeType string `json:"node_type"`
 }
 
 var (
@@ -302,21 +320,21 @@ func (a *ScriptAttributes) Reset() {
 }
 
 func (a *InputAttributes) GetNodeType() UiNodeType {
-	return a.NodeType
+	return UiNodeType(a.NodeType)
 }
 
 func (a *ImageAttributes) GetNodeType() UiNodeType {
-	return a.NodeType
+	return UiNodeType(a.NodeType)
 }
 
 func (a *AnchorAttributes) GetNodeType() UiNodeType {
-	return a.NodeType
+	return UiNodeType(a.NodeType)
 }
 
 func (a *TextAttributes) GetNodeType() UiNodeType {
-	return a.NodeType
+	return UiNodeType(a.NodeType)
 }
 
 func (a *ScriptAttributes) GetNodeType() UiNodeType {
-	return a.NodeType
+	return UiNodeType(a.NodeType)
 }

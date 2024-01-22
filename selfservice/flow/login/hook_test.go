@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package login_test
 
 import (
@@ -9,12 +12,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/ory/kratos/session"
-
 	"github.com/gobuffalo/httptest"
 	"github.com/julienschmidt/httprouter"
 	"github.com/stretchr/testify/assert"
 	"github.com/tidwall/gjson"
+
+	"github.com/ory/kratos/hydra"
+	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/session"
 
 	"github.com/ory/kratos/driver/config"
 	"github.com/ory/kratos/identity"
@@ -26,31 +31,40 @@ import (
 )
 
 func TestLoginExecutor(t *testing.T) {
-	for _, strategy := range []string{
-		identity.CredentialsTypePassword.String(),
-		identity.CredentialsTypeOIDC.String(),
-	} {
-		t.Run("strategy="+strategy, func(t *testing.T) {
-			conf, reg := internal.NewFastRegistryWithMocks(t)
-			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/login.schema.json")
-			conf.MustSet(config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/")
+	t.Parallel()
+	ctx := context.Background()
 
-			newServer := func(t *testing.T, ft flow.Type, useIdentity *identity.Identity) *httptest.Server {
+	for _, strategy := range identity.AllCredentialTypes {
+		strategy := strategy
+
+		t.Run("strategy="+strategy.String(), func(t *testing.T) {
+			t.Parallel()
+
+			conf, reg := internal.NewFastRegistryWithMocks(t)
+			reg.WithHydra(hydra.NewFake())
+			testhelpers.SetDefaultIdentitySchema(conf, "file://./stub/login.schema.json")
+			conf.MustSet(ctx, config.ViperKeySelfServiceBrowserDefaultReturnTo, "https://www.ory.sh/")
+
+			newServer := func(t *testing.T, ft flow.Type, useIdentity *identity.Identity, flowCallback ...func(*login.Flow)) *httptest.Server {
 				router := httprouter.New()
 
 				router.GET("/login/pre", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-					f, err := login.NewFlow(conf, time.Minute, "", r, ft)
+					loginFlow, err := login.NewFlow(conf, time.Minute, "", r, ft)
 					require.NoError(t, err)
-					if testhelpers.SelfServiceHookLoginErrorHandler(t, w, r, reg.LoginHookExecutor().PreLoginHook(w, r, f)) {
+					if testhelpers.SelfServiceHookLoginErrorHandler(t, w, r, reg.LoginHookExecutor().PreLoginHook(w, r, loginFlow)) {
 						_, _ = w.Write([]byte("ok"))
 					}
 				})
 
 				router.GET("/login/post", func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-					a, err := login.NewFlow(conf, time.Minute, "", r, ft)
+					loginFlow, err := login.NewFlow(conf, time.Minute, "", r, ft)
 					require.NoError(t, err)
-					a.Active = identity.CredentialsType(strategy)
-					a.RequestURL = x.RequestURL(r).String()
+					loginFlow.Active = strategy
+					loginFlow.RequestURL = x.RequestURL(r).String()
+					for _, cb := range flowCallback {
+						cb(loginFlow)
+					}
+
 					sess := session.NewInactiveSession()
 					sess.CompletedLoginFor(identity.CredentialsTypePassword, identity.AuthenticatorAssuranceLevel1)
 					if useIdentity == nil {
@@ -58,12 +72,12 @@ func TestLoginExecutor(t *testing.T) {
 					}
 
 					testhelpers.SelfServiceHookLoginErrorHandler(t, w, r,
-						reg.LoginHookExecutor().PostLoginHook(w, r, a, useIdentity, sess))
+						reg.LoginHookExecutor().PostLoginHook(w, r, strategy.ToUiNodeGroup(), loginFlow, useIdentity, sess, ""))
 				})
 
 				ts := httptest.NewServer(router)
 				t.Cleanup(ts.Close)
-				conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
+				conf.MustSet(ctx, config.ViperKeyPublicBaseURL, ts.URL)
 				return ts
 			}
 
@@ -81,7 +95,7 @@ func TestLoginExecutor(t *testing.T) {
 
 				t.Run("case=pass if hooks pass", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					viperSetPost(t, conf, strategy, []config.SelfServiceHook{{Name: "err", Config: []byte(`{}`)}})
+					viperSetPost(t, conf, strategy.String(), []config.SelfServiceHook{{Name: "err", Config: []byte(`{}`)}})
 
 					res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil), false, url.Values{})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -90,7 +104,7 @@ func TestLoginExecutor(t *testing.T) {
 
 				t.Run("case=fail if hooks fail", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					viperSetPost(t, conf, strategy, []config.SelfServiceHook{{Name: "err", Config: []byte(`{"ExecuteLoginPostHook": "abort"}`)}})
+					viperSetPost(t, conf, strategy.String(), []config.SelfServiceHook{{Name: "err", Config: []byte(`{"ExecuteLoginPostHook": "abort"}`)}})
 
 					res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil), false, url.Values{})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -99,7 +113,7 @@ func TestLoginExecutor(t *testing.T) {
 
 				t.Run("case=use return_to value", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					conf.MustSet(config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/"})
+					conf.MustSet(ctx, config.ViperKeyURLsAllowedReturnToDomains, []string{"https://www.ory.sh/"})
 
 					res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil), false, url.Values{"return_to": {"https://www.ory.sh/kratos/"}})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -108,7 +122,7 @@ func TestLoginExecutor(t *testing.T) {
 
 				t.Run("case=use nested config value", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					conf.MustSet(config.ViperKeySelfServiceLoginAfter+"."+config.DefaultBrowserReturnURL, "https://www.ory.sh/kratos")
+					conf.MustSet(ctx, config.ViperKeySelfServiceLoginAfter+"."+config.DefaultBrowserReturnURL, "https://www.ory.sh/kratos")
 
 					res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil), false, url.Values{})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -118,7 +132,7 @@ func TestLoginExecutor(t *testing.T) {
 				t.Run("case=use nested config value", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
 					testhelpers.SelfServiceHookLoginSetDefaultRedirectTo(t, conf, "https://www.ory.sh/not-kratos")
-					testhelpers.SelfServiceHookLoginSetDefaultRedirectToStrategy(t, conf, strategy, "https://www.ory.sh/kratos")
+					testhelpers.SelfServiceHookLoginSetDefaultRedirectToStrategy(t, conf, strategy.String(), "https://www.ory.sh/kratos")
 
 					res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil), false, url.Values{})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -127,7 +141,7 @@ func TestLoginExecutor(t *testing.T) {
 
 				t.Run("case=pass if hooks pass", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
-					viperSetPost(t, conf, strategy, []config.SelfServiceHook{{Name: "err", Config: []byte(`{}`)}})
+					viperSetPost(t, conf, strategy.String(), []config.SelfServiceHook{{Name: "err", Config: []byte(`{}`)}})
 
 					res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil), false, url.Values{})
 					assert.EqualValues(t, http.StatusOK, res.StatusCode)
@@ -142,6 +156,30 @@ func TestLoginExecutor(t *testing.T) {
 					assert.NotEmpty(t, gjson.Get(body, "session.identity.id").String())
 				})
 
+				t.Run("suite=handle login challenge with browser and application/json", func(t *testing.T) {
+					t.Run("case=includes the return_to address for a valid challenge", func(t *testing.T) {
+						t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+
+						withOAuthChallenge := func(f *login.Flow) {
+							f.OAuth2LoginChallenge = hydra.FakeValidLoginChallenge
+						}
+						res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil, withOAuthChallenge), true, url.Values{})
+						assert.EqualValues(t, http.StatusUnprocessableEntity, res.StatusCode)
+						assert.Equal(t, hydra.FakePostLoginURL, gjson.Get(body, "redirect_browser_to").String(), "%s", body)
+					})
+
+					t.Run("case=returns an error for an invalid challenge", func(t *testing.T) {
+						t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+
+						withOAuthChallenge := func(f *login.Flow) {
+							f.OAuth2LoginChallenge = hydra.FakeInvalidLoginChallenge
+						}
+						res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, nil, withOAuthChallenge), true, url.Values{})
+						assert.EqualValues(t, http.StatusInternalServerError, res.StatusCode)
+						assert.Equal(t, hydra.ErrFakeAcceptLoginRequestFailed.Error(), body, "%s", body)
+					})
+				})
+
 				t.Run("case=pass without hooks for browser flow with application/json", func(t *testing.T) {
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
 
@@ -153,7 +191,7 @@ func TestLoginExecutor(t *testing.T) {
 				})
 
 				t.Run("case=work normally if AAL is satisfied", func(t *testing.T) {
-					conf.MustSet(config.ViperKeySessionWhoAmIAAL, "aal1")
+					conf.MustSet(ctx, config.ViperKeySessionWhoAmIAAL, "aal1")
 					_ = testhelpers.NewLoginUIFlowEchoServer(t, reg)
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
 
@@ -169,14 +207,14 @@ func TestLoginExecutor(t *testing.T) {
 						assert.EqualValues(t, "https://www.ory.sh/", res.Request.URL.String())
 					})
 
-					t.Run("api client returns the token but not the identity", func(t *testing.T) {
+					t.Run("api client returns the session with identity and the token", func(t *testing.T) {
 						res, body := makeRequestPost(t, newServer(t, flow.TypeAPI, useIdentity), true, url.Values{})
 						assert.EqualValues(t, http.StatusOK, res.StatusCode)
 						assert.NotEmpty(t, gjson.Get(body, "session.identity").String())
 						assert.NotEmpty(t, gjson.Get(body, "session_token").String())
 					})
 
-					t.Run("browser JSON client returns the token but not the identity", func(t *testing.T) {
+					t.Run("browser JSON client returns the session with identity but not the token", func(t *testing.T) {
 						res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, useIdentity), true, url.Values{})
 						assert.EqualValues(t, http.StatusOK, res.StatusCode)
 						assert.NotEmpty(t, gjson.Get(body, "session.id").String())
@@ -186,12 +224,14 @@ func TestLoginExecutor(t *testing.T) {
 				})
 
 				t.Run("case=redirect to login if AAL is too low", func(t *testing.T) {
-					conf.MustSet(config.ViperKeySessionWhoAmIAAL, "highest_available")
+					conf.MustSet(ctx, config.ViperKeySessionWhoAmIAAL, "highest_available")
 					_ = testhelpers.NewLoginUIFlowEchoServer(t, reg)
 					t.Cleanup(func() {
-						conf.MustSet(config.ViperKeySessionWhoAmIAAL, "aal1")
+						conf.MustSet(ctx, config.ViperKeySessionWhoAmIAAL, "aal1")
 					})
 					t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+
+					conf.MustSet(ctx, config.ViperKeyOAuth2ProviderURL, "https://hydra")
 
 					useIdentity := &identity.Identity{Credentials: map[identity.CredentialsType]identity.Credentials{
 						identity.CredentialsTypePassword: {Type: identity.CredentialsTypePassword, Config: []byte(`{"hashed_password": "$argon2id$v=19$m=32,t=2,p=4$cm94YnRVOW5jZzFzcVE4bQ$MNzk5BtR2vUhrp6qQEjRNw"}`), Identifiers: []string{testhelpers.RandomEmail()}},
@@ -205,20 +245,96 @@ func TestLoginExecutor(t *testing.T) {
 						assert.Contains(t, res.Request.URL.String(), "/self-service/login/browser?aal=aal2")
 					})
 
-					t.Run("api client returns the token but not the identity", func(t *testing.T) {
+					t.Run("browser client with login challenge", func(t *testing.T) {
+						res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, useIdentity), false, url.Values{
+							"login_challenge": []string{hydra.FakeValidLoginChallenge},
+						})
+						assert.EqualValues(t, http.StatusNotFound, res.StatusCode)
+
+						assert.Equal(t, res.Request.URL.Path, "/self-service/login/browser")
+						assert.Equal(t, res.Request.URL.Query().Get("aal"), "aal2")
+						assert.Equal(t, res.Request.URL.Query().Get("login_challenge"), hydra.FakeValidLoginChallenge)
+					})
+
+					t.Run("api client returns the token and the session without the identity", func(t *testing.T) {
 						res, body := makeRequestPost(t, newServer(t, flow.TypeAPI, useIdentity), true, url.Values{})
 						assert.EqualValues(t, http.StatusOK, res.StatusCode)
 						assert.Empty(t, gjson.Get(body, "session.identity").String())
 						assert.NotEmpty(t, gjson.Get(body, "session_token").String())
 					})
 
-					t.Run("browser JSON client returns the token but not the identity", func(t *testing.T) {
+					t.Run("browser JSON client", func(t *testing.T) {
 						res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, useIdentity), true, url.Values{})
-						assert.EqualValues(t, http.StatusOK, res.StatusCode)
-						assert.NotEmpty(t, gjson.Get(body, "session.id").String())
-						assert.Empty(t, gjson.Get(body, "session.identity").String())
-						assert.Empty(t, gjson.Get(body, "session_token").String())
+						assert.EqualValues(t, http.StatusUnprocessableEntity, res.StatusCode)
+						assert.NotEmpty(t, gjson.Get(body, "redirect_browser_to").String())
+						assert.Contains(t, gjson.Get(body, "redirect_browser_to").String(), "/self-service/login/browser?aal=aal2", "%s", body)
 					})
+
+					t.Run("browser JSON client with login challenge", func(t *testing.T) {
+						res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, useIdentity), true, url.Values{
+							"login_challenge": []string{hydra.FakeValidLoginChallenge},
+						})
+						assert.EqualValues(t, http.StatusUnprocessableEntity, res.StatusCode)
+						assert.NotEmpty(t, gjson.Get(body, "redirect_browser_to").String())
+
+						redirectBrowserTo, err := url.Parse(gjson.Get(body, "redirect_browser_to").String())
+						require.NoError(t, err)
+
+						assert.Equal(t, redirectBrowserTo.Path, "/self-service/login/browser")
+						assert.Equal(t, redirectBrowserTo.Query().Get("aal"), "aal2")
+						assert.Equal(t, redirectBrowserTo.Query().Get("login_challenge"), hydra.FakeValidLoginChallenge)
+					})
+				})
+			})
+			t.Run("case=maybe links credential", func(t *testing.T) {
+				t.Cleanup(testhelpers.SelfServiceHookConfigReset(t, conf))
+
+				email := testhelpers.RandomEmail()
+				useIdentity := &identity.Identity{Credentials: map[identity.CredentialsType]identity.Credentials{
+					identity.CredentialsTypePassword: {
+						Type:        identity.CredentialsTypePassword,
+						Config:      []byte(`{"hashed_password": "$argon2id$v=19$m=32,t=2,p=4$cm94YnRVOW5jZzFzcVE4bQ$MNzk5BtR2vUhrp6qQEjRNw"}`),
+						Identifiers: []string{email},
+					},
+				}}
+				require.NoError(t, reg.Persister().CreateIdentity(context.Background(), useIdentity))
+
+				credsOIDC, err := identity.NewCredentialsOIDC(
+					"id-token",
+					"access-token",
+					"refresh-token",
+					"my-provider",
+					email,
+					"",
+				)
+				require.NoError(t, err)
+
+				t.Run("sub-case=links matching identity", func(t *testing.T) {
+					res, _ := makeRequestPost(t, newServer(t, flow.TypeBrowser, useIdentity, func(l *login.Flow) {
+						require.NoError(t, flow.SetDuplicateCredentials(l, flow.DuplicateCredentialsData{
+							CredentialsType:     identity.CredentialsTypeOIDC,
+							CredentialsConfig:   credsOIDC.Config,
+							DuplicateIdentifier: email,
+						}))
+					}), false, url.Values{})
+					assert.EqualValues(t, http.StatusOK, res.StatusCode)
+					assert.EqualValues(t, "https://www.ory.sh/", res.Request.URL.String())
+
+					ident, err := reg.Persister().GetIdentity(ctx, useIdentity.ID, identity.ExpandCredentials)
+					require.NoError(t, err)
+					assert.Equal(t, 2, len(ident.Credentials))
+				})
+
+				t.Run("sub-case=errors on non-matching identity", func(t *testing.T) {
+					res, body := makeRequestPost(t, newServer(t, flow.TypeBrowser, useIdentity, func(l *login.Flow) {
+						require.NoError(t, flow.SetDuplicateCredentials(l, flow.DuplicateCredentialsData{
+							CredentialsType:     identity.CredentialsTypeOIDC,
+							CredentialsConfig:   credsOIDC.Config,
+							DuplicateIdentifier: "wrong@example.com",
+						}))
+					}), false, url.Values{})
+					assert.EqualValues(t, http.StatusInternalServerError, res.StatusCode)
+					assert.Equal(t, schema.NewLinkedCredentialsDoNotMatch().Error(), body, "%s", body)
 				})
 			})
 
@@ -242,6 +358,12 @@ func TestLoginExecutor(t *testing.T) {
 					},
 					conf,
 				))
+			})
+
+			t.Run("requiresAAL2 should return true if there's an error", func(t *testing.T) {
+				requiresAAL2, err := login.RequiresAAL2ForTest(*reg.LoginHookExecutor(), &http.Request{}, &session.Session{})
+				require.NotNil(t, err)
+				require.True(t, requiresAAL2)
 			})
 		})
 	}

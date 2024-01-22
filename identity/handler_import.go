@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package identity
 
 import (
@@ -11,7 +14,7 @@ import (
 	"github.com/ory/kratos/x"
 )
 
-func (h *Handler) importCredentials(ctx context.Context, i *Identity, creds *AdminIdentityImportCredentials) error {
+func (h *Handler) importCredentials(ctx context.Context, i *Identity, creds *IdentityWithCredentials) error {
 	if creds == nil {
 		return nil
 	}
@@ -28,6 +31,18 @@ func (h *Handler) importCredentials(ctx context.Context, i *Identity, creds *Adm
 		}
 	}
 
+	if creds.TOTP != nil {
+		if err := h.importTOTPCredentials(ctx, i, creds.TOTP); err != nil {
+			return err
+		}
+	}
+
+	if creds.Lookup != nil {
+		if err := h.importLookupCredentials(ctx, i, creds.Lookup); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -37,7 +52,7 @@ func (h *Handler) importPasswordCredentials(ctx context.Context, i *Identity, cr
 	hashed := []byte(creds.Config.HashedPassword)
 	if len(creds.Config.Password) > 0 {
 		// Importing a clear text password
-		hashed, err = h.r.Hasher().Generate(ctx, []byte(creds.Config.Password))
+		hashed, err = h.r.Hasher(ctx).Generate(ctx, []byte(creds.Config.Password))
 		if err != nil {
 			return err
 		}
@@ -45,7 +60,7 @@ func (h *Handler) importPasswordCredentials(ctx context.Context, i *Identity, cr
 		creds.Config.HashedPassword = string(hashed)
 	}
 
-	if !(hash.IsArgon2idHash(hashed) || hash.IsArgon2iHash(hashed) || hash.IsBcryptHash(hashed) || hash.IsPbkdf2Hash(hashed)) {
+	if !(hash.IsValidHashFormat(hashed)) {
 		return errors.WithStack(herodot.ErrBadRequest.WithReasonf("The imported password does not match any known hash format. For more information see https://www.ory.sh/dr/2"))
 	}
 
@@ -85,4 +100,36 @@ func (h *Handler) importOIDCCredentials(_ context.Context, i *Identity, creds *A
 		})
 	}
 	return i.SetCredentialsWithConfig(CredentialsTypeOIDC, *c, &target)
+}
+
+func (h *Handler) importTOTPCredentials(_ context.Context, i *Identity, creds *AdminIdentityImportCredentialsTOTP) error {
+	return i.SetCredentialsWithConfig(CredentialsTypeTOTP, Credentials{Identifiers: []string{i.ID.String()}}, CredentialsTOTPConfig{TOTPURL: creds.Config.TOTPURL})
+}
+
+func (h *Handler) importLookupCredentials(_ context.Context, i *Identity, creds *AdminIdentityImportCredentialsLookup) error {
+	var target CredentialsLookupConfig
+	c, ok := i.GetCredentials(CredentialsTypeLookup)
+	if !ok {
+		var lookupSecrets []LookupSecret
+		for _, s := range creds.Config.LookupSecrets {
+			lookupSecrets = append(lookupSecrets, LookupSecret(s))
+		}
+
+		return i.SetCredentialsWithConfig(
+			CredentialsTypeLookup,
+			Credentials{Identifiers: []string{i.ID.String()}},
+			CredentialsLookupConfig{LookupSecrets: lookupSecrets},
+		)
+	}
+
+	if err := json.Unmarshal(c.Config, &target); err != nil {
+		return errors.WithStack(x.PseudoPanic.WithWrap(err))
+	}
+
+	c.Identifiers = []string{i.ID.String()}
+	for _, s := range creds.Config.LookupSecrets {
+		target.LookupSecrets = append(target.LookupSecrets, LookupSecret(s))
+	}
+
+	return i.SetCredentialsWithConfig(CredentialsTypeLookup, *c, &target)
 }

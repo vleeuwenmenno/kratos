@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package template
 
 import (
@@ -9,17 +12,7 @@ import (
 	"github.com/ory/x/httpx"
 )
 
-type (
-	Config interface {
-		CourierTemplatesRoot() string
-		CourierTemplatesVerificationInvalid() *config.CourierEmailTemplate
-		CourierTemplatesVerificationValid() *config.CourierEmailTemplate
-		CourierTemplatesRecoveryInvalid() *config.CourierEmailTemplate
-		CourierTemplatesRecoveryValid() *config.CourierEmailTemplate
-	}
-
-	Dependencies interface {
-		CourierConfig(ctx context.Context) config.CourierConfigs
-		HTTPClient(ctx context.Context, opts ...httpx.ResilientOptions) *retryablehttp.Client
-	}
-)
+type Dependencies interface {
+	CourierConfig() config.CourierConfigs
+	HTTPClient(ctx context.Context, opts ...httpx.ResilientOptions) *retryablehttp.Client
+}

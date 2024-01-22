@@ -1,3 +1,6 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package node
 
 import (
@@ -41,6 +44,7 @@ const (
 	OpenIDConnectGroup UiNodeGroup = "oidc"
 	ProfileGroup       UiNodeGroup = "profile"
 	LinkGroup          UiNodeGroup = "link"
+	CodeGroup          UiNodeGroup = "code"
 	TOTPGroup          UiNodeGroup = "totp"
 	LookupGroup        UiNodeGroup = "lookup_secret"
 	WebAuthnGroup      UiNodeGroup = "webauthn"
@@ -353,23 +357,23 @@ func (n *Node) UnmarshalJSON(data []byte) error {
 	switch t := gjson.GetBytes(data, "type").String(); UiNodeType(t) {
 	case Text:
 		attr = &TextAttributes{
-			NodeType: Text,
+			NodeType: string(Text),
 		}
 	case Input:
 		attr = &InputAttributes{
-			NodeType: Input,
+			NodeType: string(Input),
 		}
 	case Anchor:
 		attr = &AnchorAttributes{
-			NodeType: Anchor,
+			NodeType: string(Anchor),
 		}
 	case Image:
 		attr = &ImageAttributes{
-			NodeType: Image,
+			NodeType: string(Image),
 		}
 	case Script:
 		attr = &ScriptAttributes{
-			NodeType: Script,
+			NodeType: string(Script),
 		}
 	default:
 		return fmt.Errorf("unexpected node type: %s", t)
@@ -396,19 +400,19 @@ func (n *Node) MarshalJSON() ([]byte, error) {
 		switch attr := n.Attributes.(type) {
 		case *TextAttributes:
 			t = Text
-			attr.NodeType = Text
+			attr.NodeType = string(Text)
 		case *InputAttributes:
 			t = Input
-			attr.NodeType = Input
+			attr.NodeType = string(Input)
 		case *AnchorAttributes:
 			t = Anchor
-			attr.NodeType = Anchor
+			attr.NodeType = string(Anchor)
 		case *ImageAttributes:
 			t = Image
-			attr.NodeType = Image
+			attr.NodeType = string(Image)
 		case *ScriptAttributes:
 			t = Script
-			attr.NodeType = Script
+			attr.NodeType = string(Script)
 		default:
 			return nil, errors.WithStack(fmt.Errorf("unknown node type: %T", n.Attributes))
 		}

@@ -1,8 +1,15 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package oidc
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/url"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -23,8 +30,8 @@ type ProviderFacebook struct {
 
 func NewProviderFacebook(
 	config *Configuration,
-	reg dependencies,
-) *ProviderFacebook {
+	reg Dependencies,
+) Provider {
 	config.IssuerURL = "https://www.facebook.com"
 	return &ProviderFacebook{
 		ProviderGenericOIDC: &ProviderGenericOIDC{
@@ -32,6 +39,15 @@ func NewProviderFacebook(
 			reg:    reg,
 		},
 	}
+}
+
+func (g *ProviderFacebook) generateAppSecretProof(ctx context.Context, exchange *oauth2.Token) string {
+	secret := g.config.ClientSecret
+	data := exchange.AccessToken
+
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(data))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (g *ProviderFacebook) OAuth2(ctx context.Context) (*oauth2.Config, error) {
@@ -52,13 +68,14 @@ func (g *ProviderFacebook) Claims(ctx context.Context, exchange *oauth2.Token, q
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
-	client := g.reg.HTTPClient(ctx, httpx.ResilientClientWithClient(o.Client(ctx, exchange)))
-	u, err := url.Parse("https://graph.facebook.com/me?fields=id,name,first_name,last_name,middle_name,email,picture,birthday,gender")
+	appSecretProof := g.generateAppSecretProof(ctx, exchange)
+	u, err := url.Parse(fmt.Sprintf("https://graph.facebook.com/me?fields=id,name,first_name,last_name,middle_name,email,picture,birthday,gender&appsecret_proof=%s", appSecretProof))
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 
-	req, err := retryablehttp.NewRequest("GET", u.String(), nil)
+	ctx, client := httpx.SetOAuth2(ctx, g.reg.HTTPClient(ctx), o, exchange)
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
@@ -68,6 +85,10 @@ func (g *ProviderFacebook) Claims(ctx context.Context, exchange *oauth2.Token, q
 		return nil, errors.WithStack(herodot.ErrInternalServerError.WithReasonf("%s", err))
 	}
 	defer resp.Body.Close()
+
+	if err := logUpstreamError(g.reg.Logger(), resp); err != nil {
+		return nil, err
+	}
 
 	var user struct {
 		Id            string `json:"id,omitempty"`

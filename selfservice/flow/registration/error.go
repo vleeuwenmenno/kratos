@@ -1,9 +1,18 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package registration
 
 import (
 	"net/http"
 
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/ory/kratos/identity"
+	"github.com/ory/kratos/schema"
+	"github.com/ory/kratos/selfservice/sessiontokenexchange"
 	"github.com/ory/kratos/ui/node"
+	"github.com/ory/kratos/x/events"
 
 	"github.com/ory/kratos/selfservice/flow"
 	"github.com/ory/kratos/text"
@@ -29,6 +38,7 @@ type (
 		x.LoggingProvider
 		config.Provider
 
+		sessiontokenexchange.PersistenceProvider
 		FlowPersistenceProvider
 		HandlerProvider
 	}
@@ -55,7 +65,7 @@ func (s *ErrorHandler) PrepareReplacementForExpiredFlow(w http.ResponseWriter, r
 		return nil, err
 	}
 
-	a.UI.Messages.Add(text.NewErrorValidationRegistrationFlowExpired(e.Ago))
+	a.UI.Messages.Add(text.NewErrorValidationRegistrationFlowExpired(e.ExpiredAt))
 	if err := s.d.RegistrationFlowPersister().UpdateRegistrationFlow(r.Context(), a); err != nil {
 		return nil, err
 	}
@@ -69,6 +79,11 @@ func (s *ErrorHandler) WriteFlowError(
 	group node.UiNodeGroup,
 	err error,
 ) {
+
+	if dup := new(identity.ErrDuplicateCredentials); errors.As(err, &dup) {
+		err = schema.NewDuplicateCredentialsError(dup)
+	}
+
 	s.d.Audit().
 		WithError(err).
 		WithRequest(r).
@@ -76,9 +91,11 @@ func (s *ErrorHandler) WriteFlowError(
 		Info("Encountered self-service flow error.")
 
 	if f == nil {
+		trace.SpanFromContext(r.Context()).AddEvent(events.NewRegistrationFailed(r.Context(), "", ""))
 		s.forward(w, r, nil, err)
 		return
 	}
+	trace.SpanFromContext(r.Context()).AddEvent(events.NewRegistrationFailed(r.Context(), string(f.Type), f.Active.String()))
 
 	if expired, inner := s.PrepareReplacementForExpiredFlow(w, r, f, err); inner != nil {
 		s.forward(w, r, f, err)
@@ -87,7 +104,7 @@ func (s *ErrorHandler) WriteFlowError(
 		if f.Type == flow.TypeAPI || x.IsJSONRequest(r) {
 			s.d.Writer().WriteError(w, r, expired)
 		} else {
-			http.Redirect(w, r, expired.GetFlow().AppendTo(s.d.Config(r.Context()).SelfServiceFlowRegistrationUI()).String(), http.StatusSeeOther)
+			http.Redirect(w, r, expired.GetFlow().AppendTo(s.d.Config().SelfServiceFlowRegistrationUI(r.Context())).String(), http.StatusSeeOther)
 		}
 		return
 	}
@@ -98,7 +115,7 @@ func (s *ErrorHandler) WriteFlowError(
 		return
 	}
 
-	ds, err := s.d.Config(r.Context()).DefaultIdentityTraitsSchemaURL()
+	ds, err := s.d.Config().DefaultIdentityTraitsSchemaURL(r.Context())
 	if err != nil {
 		s.forward(w, r, f, err)
 		return
@@ -115,7 +132,11 @@ func (s *ErrorHandler) WriteFlowError(
 	}
 
 	if f.Type == flow.TypeBrowser && !x.IsJSONRequest(r) {
-		http.Redirect(w, r, f.AppendTo(s.d.Config(r.Context()).SelfServiceFlowRegistrationUI()).String(), http.StatusFound)
+		http.Redirect(w, r, f.AppendTo(s.d.Config().SelfServiceFlowRegistrationUI(r.Context())).String(), http.StatusFound)
+		return
+	}
+	if _, hasCode, _ := s.d.SessionTokenExchangePersister().CodeForFlow(r.Context(), f.ID); group == node.OpenIDConnectGroup && f.Type == flow.TypeAPI && hasCode {
+		http.Redirect(w, r, f.ReturnTo, http.StatusSeeOther)
 		return
 	}
 

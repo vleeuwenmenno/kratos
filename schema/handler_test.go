@@ -1,15 +1,21 @@
+// Copyright © 2023 Ory Corp
+// SPDX-License-Identifier: Apache-2.0
+
 package schema_test
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/ory/client-go"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,6 +30,7 @@ import (
 )
 
 func TestHandler(t *testing.T) {
+	ctx := context.Background()
 	conf, reg := internal.NewFastRegistryWithMocks(t)
 	router := x.NewRouterPublic()
 	reg.SchemaHandler().RegisterPublicRoutes(router)
@@ -74,10 +81,10 @@ func TestHandler(t *testing.T) {
 		return s
 	}
 
-	getFromTS := func(url string, expectCode int) []byte {
+	getFromTS := func(t *testing.T, url string, expectCode int) []byte {
 		res, err := ts.Client().Get(url)
 		require.NoError(t, err)
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		require.NoError(t, err)
 		require.NoError(t, res.Body.Close())
 
@@ -85,12 +92,12 @@ func TestHandler(t *testing.T) {
 		return body
 	}
 
-	getFromTSById := func(id string, expectCode int) []byte {
-		return getFromTS(fmt.Sprintf("%s/schemas/%s", ts.URL, id), expectCode)
+	getFromTSById := func(t *testing.T, id string, expectCode int) []byte {
+		return getFromTS(t, fmt.Sprintf("%s/schemas/%s", ts.URL, id), expectCode)
 	}
 
-	getFromTSPaginated := func(page, perPage, expectCode int) []byte {
-		return getFromTS(fmt.Sprintf("%s/schemas?page=%d&per_page=%d", ts.URL, page, perPage), expectCode)
+	getFromTSPaginated := func(t *testing.T, page, perPage, expectCode int) []byte {
+		return getFromTS(t, fmt.Sprintf("%s/schemas?page=%d&per_page=%d", ts.URL, page, perPage), expectCode)
 	}
 
 	getFromFS := func(id string) []byte {
@@ -117,54 +124,54 @@ func TestHandler(t *testing.T) {
 				URL: s.RawURL,
 			})
 		}
-		conf.MustSet(config.ViperKeyIdentitySchemas, schemasConfig)
+		conf.MustSet(ctx, config.ViperKeyIdentitySchemas, schemasConfig)
 	}
 
-	conf.MustSet(config.ViperKeyPublicBaseURL, ts.URL)
-	conf.MustSet(config.ViperKeyDefaultIdentitySchemaID, config.DefaultIdentityTraitsSchemaID)
+	conf.MustSet(ctx, config.ViperKeyPublicBaseURL, ts.URL)
+	conf.MustSet(ctx, config.ViperKeyDefaultIdentitySchemaID, config.DefaultIdentityTraitsSchemaID)
 	setSchemas(schemas)
 
 	t.Run("case=get default schema", func(t *testing.T) {
-		server := getFromTSById(config.DefaultIdentityTraitsSchemaID, http.StatusOK)
+		server := getFromTSById(t, config.DefaultIdentityTraitsSchemaID, http.StatusOK)
 		file := getFromFS(config.DefaultIdentityTraitsSchemaID)
 		require.JSONEq(t, string(file), string(server))
 	})
 
 	t.Run("case=get other schema", func(t *testing.T) {
-		server := getFromTSById("identity2", http.StatusOK)
+		server := getFromTSById(t, "identity2", http.StatusOK)
 		file := getFromFS("identity2")
 		require.JSONEq(t, string(file), string(server))
 	})
 
 	t.Run("case=get base64 schema", func(t *testing.T) {
-		server := getFromTSById("base64", http.StatusOK)
+		server := getFromTSById(t, "base64", http.StatusOK)
 		file := getFromFS("base64")
 		require.JSONEq(t, string(file), string(server))
 	})
 
 	t.Run("case=get encoded schema", func(t *testing.T) {
-		server := getFromTSById("cHJlc2V0Oi8vZW1haWw", http.StatusOK)
+		server := getFromTSById(t, "cHJlc2V0Oi8vZW1haWw", http.StatusOK)
 		file := getFromFS("preset://email")
 		require.JSONEq(t, string(file), string(server))
 	})
 
 	t.Run("case=get unreachable schema", func(t *testing.T) {
-		reason := getFromTSById("unreachable", http.StatusInternalServerError)
+		reason := getFromTSById(t, "unreachable", http.StatusInternalServerError)
 		require.Contains(t, string(reason), "could not be found or opened")
 	})
 
 	t.Run("case=get no-file schema", func(t *testing.T) {
-		reason := getFromTSById("no-file", http.StatusInternalServerError)
+		reason := getFromTSById(t, "no-file", http.StatusInternalServerError)
 		require.Contains(t, string(reason), "could not be found or opened")
 	})
 
 	t.Run("case=get directory schema", func(t *testing.T) {
-		reason := getFromTSById("directory", http.StatusInternalServerError)
+		reason := getFromTSById(t, "directory", http.StatusInternalServerError)
 		require.Contains(t, string(reason), "could not be found or opened")
 	})
 
 	t.Run("case=get not-existing schema", func(t *testing.T) {
-		_ = getFromTSById("not-existing", http.StatusNotFound)
+		_ = getFromTSById(t, "not-existing", http.StatusNotFound)
 	})
 
 	t.Run("case=get all schemas", func(t *testing.T) {
@@ -181,9 +188,9 @@ func TestHandler(t *testing.T) {
 			},
 		})
 
-		body := getFromTSPaginated(0, 2, http.StatusOK)
+		body := getFromTSPaginated(t, 0, 2, http.StatusOK)
 
-		var result schema.IdentitySchemas
+		var result []client.IdentitySchemaContainer
 		require.NoError(t, json.Unmarshal(body, &result))
 
 		ids_orig := []string{}
@@ -192,7 +199,7 @@ func TestHandler(t *testing.T) {
 		}
 		ids_list := []string{}
 		for _, s := range result {
-			ids_list = append(ids_list, s.ID)
+			ids_list = append(ids_list, *s.Id)
 		}
 		for _, id := range ids_orig {
 			require.Contains(t, ids_list, id)
@@ -200,8 +207,10 @@ func TestHandler(t *testing.T) {
 
 		for _, s := range schemas {
 			for _, r := range result {
-				if r.ID == s.ID {
-					assert.JSONEq(t, string(getFromFS(s.ID)), string(r.Schema))
+				if *r.Id == s.ID {
+					j, err := json.Marshal(r.Schema)
+					require.NoError(t, err)
+					assert.JSONEq(t, string(getFromFS(s.ID)), string(j))
 				}
 			}
 		}
@@ -221,7 +230,7 @@ func TestHandler(t *testing.T) {
 			},
 		})
 
-		body1, body2 := getFromTSPaginated(0, 1, http.StatusOK), getFromTSPaginated(1, 1, http.StatusOK)
+		body1, body2 := getFromTSPaginated(t, 0, 1, http.StatusOK), getFromTSPaginated(t, 1, 1, http.StatusOK)
 
 		var result1, result2 schema.IdentitySchemas
 		require.NoError(t, json.Unmarshal(body1, &result1))
@@ -256,11 +265,11 @@ func TestHandler(t *testing.T) {
 			},
 		})
 
-		src, err := schema.ReadSchema(&schemas[0])
+		src, err := reg.SchemaHandler().ReadSchema(ctx, &schemas[0])
 		require.NoError(t, err)
 		defer src.Close()
 
-		src, err = schema.ReadSchema(&schemas[1])
+		src, err = reg.SchemaHandler().ReadSchema(ctx, &schemas[1])
 		require.NoError(t, err)
 		defer src.Close()
 	})
